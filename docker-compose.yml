@@ -17,7 +17,9 @@ services:
       - "127.0.0.1:5432:5432"
 
   backend:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
     env_file: .env
     environment:
