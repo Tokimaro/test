@@ -13,7 +13,11 @@ from collections.abc import Awaitable, Callable
 import structlog
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from app.brokers.base import BrokerAdapter
+from app.brokers.alpaca import DATA_URL as ALPACA_DATA_URL
+from app.brokers.alpaca import LIVE_URL as ALPACA_LIVE_URL
+from app.brokers.alpaca import PAPER_URL as ALPACA_PAPER_URL
+from app.brokers.alpaca import AlpacaAdapter, AlpacaClient
+from app.brokers.base import BrokerAdapter, BrokerError
 from app.brokers.bybit.adapter import BybitAdapter
 from app.brokers.bybit.client import BybitHttpClient
 from app.brokers.paper import PaperBroker
@@ -25,6 +29,7 @@ from app.db.repo import TradeRepo
 from app.db.session import make_engine, make_sessionmaker
 from app.domain import MarketType, Timeframe
 from app.market.feed import CandleFeed
+from app.market.store import CandleStore, RoutingCandleStore
 from app.trading_config import MarketSettings, TradingConfig
 
 log = structlog.get_logger()
@@ -52,15 +57,17 @@ class BotRuntime:
             sessionmaker = make_sessionmaker(self.db)
         self.sm = sessionmaker
         self.repo = TradeRepo(self.sm, settings.mode.value)
-        self.store = SqlCandleStore(self.sm, broker="bybit")
+        self.store: CandleStore = RoutingCandleStore({})
         self.brokers: dict[str, BrokerAdapter] = {}
         self.data_brokers: dict[str, BrokerAdapter] = {}
         self.feeds: dict[str, CandleFeed] = {}
         self.engine: TradingEngine | None = None
         self._tasks: list[asyncio.Task[None]] = []
 
-    def _make_broker(self, market: MarketSettings) -> tuple[BrokerAdapter, BrokerAdapter]:
-        """Возвращает (торговый брокер, источник данных)."""
+    def _make_broker(self, market: MarketSettings) -> tuple[BrokerAdapter, BrokerAdapter] | None:
+        """Возвращает (торговый брокер, источник данных) или None, если рынок недоступен."""
+        if market.broker == "alpaca":
+            return self._make_alpaca(market)
         s = self.settings
         key = s.bybit_api_key.get_secret_value()
         secret = s.bybit_api_secret.get_secret_value()
@@ -84,6 +91,24 @@ class BotRuntime:
         )
         return adapter, adapter
 
+    def _make_alpaca(self, market: MarketSettings) -> tuple[BrokerAdapter, BrokerAdapter] | None:
+        s = self.settings
+        key = s.alpaca_api_key.get_secret_value()
+        secret = s.alpaca_api_secret.get_secret_value()
+        if not (key and secret):
+            log.warning("runtime.alpaca_keys_missing", hint="задайте TB_ALPACA_API_KEY/SECRET")
+            return None
+        # paper-режим бота всегда торгует на paper-счёте Alpaca
+        paper = s.mode is not RunMode.LIVE or s.alpaca_paper
+        adapter = AlpacaAdapter(
+            AlpacaClient(ALPACA_PAPER_URL if paper else ALPACA_LIVE_URL, key, secret),
+            AlpacaClient(ALPACA_DATA_URL, key, secret),
+            paper=paper,
+            feed=s.alpaca_feed,
+            session_buffer_minutes=market.session_buffer_minutes,
+        )
+        return adapter, adapter
+
     async def start(self) -> None:
         saved = await self.repo.get_setting(TRADING_CONFIG_KEY)
         if saved:
@@ -93,19 +118,36 @@ class BotRuntime:
             except ValueError as exc:
                 log.error("runtime.saved_config_invalid", error=str(exc))
         instrument_ids: dict[str, int] = {}
+        routes: dict[str, CandleStore] = {}
         for name, market in self.config.markets.items():
             if not market.enabled or not market.symbols:
                 continue
-            broker, data = self._make_broker(market)
-            self.brokers[name], self.data_brokers[name] = broker, data
+            made = self._make_broker(market)
+            if made is None:
+                self.bus.publish("alert", level="warning", kind="market_unavailable", market=name)
+                continue
+            broker, data = made
+            store = SqlCandleStore(self.sm, broker=market.broker)
+            try:
+                ids = {
+                    s: await store.register(await data.get_instrument(s)) for s in market.symbols
+                }
+            except BrokerError as exc:
+                # один недоступный рынок не должен останавливать остальные
+                log.error("runtime.market_init_failed", market=name, error=str(exc))
+                self.bus.publish(
+                    "alert", level="error", kind="market_unavailable", market=name, error=str(exc)
+                )
+                await broker.aclose()
+                continue
             if isinstance(broker, PaperBroker):
                 state = await self.repo.get_state(f"{PAPER_STATE_KEY}:{name}")
                 if state:
                     broker.load_dict(state)
-            for symbol in market.symbols:
-                instrument_ids[symbol] = await self.store.register(
-                    await data.get_instrument(symbol)
-                )
+            self.brokers[name], self.data_brokers[name] = broker, data
+            instrument_ids |= ids
+            routes |= dict.fromkeys(market.symbols, store)
+        self.store = RoutingCandleStore(routes)
 
         engine = TradingEngine(
             config=self.config,

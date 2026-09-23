@@ -50,12 +50,15 @@ class SqlCandleStore:
     # asyncpg ограничивает число параметров запроса (32767); 8 колонок на строку
     BATCH = 2000
 
-    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], broker: str) -> None:
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], broker: str | None) -> None:
+        """broker=None — только чтение, инструмент ищется по символу у любого брокера."""
         self._sm = sessionmaker
         self._broker = broker
         self._ids: dict[str, int] = {}
 
     async def register(self, inst: Instrument) -> int:
+        if self._broker is None:
+            raise ValueError("для регистрации инструментов нужен broker")
         async with self._sm() as session, session.begin():
             iid = await upsert_instrument(session, self._broker, inst)
         self._ids[inst.symbol] = iid
@@ -63,12 +66,11 @@ class SqlCandleStore:
 
     async def _id(self, symbol: str) -> int:
         if symbol not in self._ids:
+            q = select(InstrumentRow.id).where(InstrumentRow.symbol == symbol)
+            if self._broker is not None:
+                q = q.where(InstrumentRow.broker == self._broker)
             async with self._sm() as session:
-                iid = await session.scalar(
-                    select(InstrumentRow.id).where(
-                        InstrumentRow.broker == self._broker, InstrumentRow.symbol == symbol
-                    )
-                )
+                iid = await session.scalar(q.order_by(InstrumentRow.id).limit(1))
             if iid is None:
                 raise KeyError(f"инструмент {self._broker}:{symbol} не зарегистрирован")
             self._ids[symbol] = iid
@@ -149,10 +151,13 @@ class SqlCandleStore:
         ]
 
 
-async def load_instrument(session: AsyncSession, broker: str, symbol: str) -> Instrument | None:
-    row = await session.scalar(
-        select(InstrumentRow).where(InstrumentRow.broker == broker, InstrumentRow.symbol == symbol)
-    )
+async def load_instrument(
+    session: AsyncSession, broker: str | None, symbol: str
+) -> Instrument | None:
+    q = select(InstrumentRow).where(InstrumentRow.symbol == symbol)
+    if broker is not None:
+        q = q.where(InstrumentRow.broker == broker)
+    row = await session.scalar(q.order_by(InstrumentRow.id).limit(1))
     if row is None:
         return None
     return Instrument(

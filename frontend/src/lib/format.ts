@@ -44,6 +44,7 @@ export const REJECTS: Record<string, string> = {
   paused: "торговля на паузе",
   market_closed: "рынок закрыт",
   order_uncertain: "исход ордера неизвестен",
+  short_not_allowed: "шорт запрещён на рынке",
 };
 
 export const rejectLabel = (r: string | null): string => {

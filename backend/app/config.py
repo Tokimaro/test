@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     master_key: SecretStr = SecretStr("")
     cors_origins: list[str] = ["http://localhost:5173"]
 
+    # Alpaca (акции США). В режиме paper всегда используется paper-счёт Alpaca;
+    # в live — реальный, только если alpaca_paper=false задан явно.
+    alpaca_api_key: SecretStr = SecretStr("")
+    alpaca_api_secret: SecretStr = SecretStr("")
+    alpaca_paper: bool = True
+    alpaca_feed: str = "iex"
+
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
 

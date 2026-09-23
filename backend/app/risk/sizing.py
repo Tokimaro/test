@@ -47,6 +47,7 @@ def size_position(
     atr: Decimal | None = None,
     slippage_pct: Decimal = Decimal("0.0005"),
     derivatives: bool = True,
+    gap_risk_pct: Decimal = Decimal(0),
 ) -> SizingResult:
     if equity <= 0 or entry <= 0 or stop <= 0:
         return _reject("invalid_inputs")
@@ -59,7 +60,8 @@ def size_position(
     fee = instrument.taker_fee
     # Вход и выход по стопу — рыночные: комиссия на обе ноги + проскальзывание на обеих
     cost_per_unit = entry * fee + stop * fee + (entry + stop) * slippage_pct
-    loss_per_unit = stop_dist + cost_per_unit
+    # для акций: стоп может исполниться хуже на величину гэпа при открытии сессии
+    loss_per_unit = stop_dist + cost_per_unit + stop * gap_risk_pct
     risk_budget = equity * Decimal(str(risk_pct)) / 100
 
     qty = instrument.round_qty(risk_budget / loss_per_unit)

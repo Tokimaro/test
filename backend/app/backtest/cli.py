@@ -28,12 +28,12 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     tfs = market.timeframes
     engine = make_engine(settings.database_url)
     sm = make_sessionmaker(engine)
-    store = SqlCandleStore(sm, broker="bybit")
+    store = SqlCandleStore(sm, broker=None)
     try:
         data = []
         for symbol in args.symbols:
             async with sm() as session:
-                inst = await load_instrument(session, "bybit", symbol)
+                inst = await load_instrument(session, None, symbol)
             if inst is None:
                 raise SystemExit(f"{symbol}: нет в БД — сначала запустите app.market.backfill")
             frames = {}

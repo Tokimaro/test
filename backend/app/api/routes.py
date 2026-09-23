@@ -465,7 +465,7 @@ async def candles(
     limit: int = Query(500, ge=10, le=5000),
     end_ms: int | None = None,
 ) -> list[dict[str, float]]:
-    store = SqlCandleStore(ctx.sm, broker="bybit")
+    store = SqlCandleStore(ctx.sm, broker=None)
     try:
         rows = await store.get_candles(symbol, tf, end_ms=end_ms, limit=limit)
     except KeyError as exc:

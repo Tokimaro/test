@@ -111,9 +111,16 @@ class TimeframeSet(_Model):
 class MarketSettings(_Model):
     enabled: bool = True
     market_type: MarketType
-    category: str  # категория Bybit: linear / spot
+    broker: str = "bybit"  # bybit | alpaca
+    category: str  # категория Bybit: linear / spot; для акций — "stock"
     symbols: list[str] = Field(default_factory=list)
     timeframes: TimeframeSet
+    allow_short: bool = True
+    # Запас на гэп: стоп акции может исполниться хуже из-за разрыва на открытии.
+    # Добавляется к расстоянию до стопа при расчёте объёма (доля цены).
+    gap_risk_pct: float = Field(0.0, ge=0, le=0.2)
+    # Не входить в первые/последние N минут торговой сессии
+    session_buffer_minutes: int = Field(0, ge=0, le=120)
 
 
 class RegimeWeights(_Model):

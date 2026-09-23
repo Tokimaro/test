@@ -21,3 +21,4 @@ data/
 *.log
 .DS_Store
 static/
+*.tsbuildinfo

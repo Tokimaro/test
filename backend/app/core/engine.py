@@ -280,6 +280,8 @@ class TradingEngine:
         if self.paused:
             return False, "paused"
         broker = self.brokers[market_name]
+        if signal.direction is Direction.SHORT and not market.allow_short:
+            return False, "short_not_allowed"
         if not broker.is_market_open(symbol, now):
             return False, "market_closed"
         corr = await self._correlations(symbol, market) if self.risk.state.open else None
@@ -311,6 +313,7 @@ class TradingEngine:
             max_leverage=Decimal(str(self.risk.settings.max_leverage)),
             atr=Decimal(str(plan.atr)),
             derivatives=derivatives,
+            gap_risk_pct=Decimal(str(market.gap_risk_pct)),
         )
         if not sizing.ok:
             return False, f"size_{sizing.reject}"

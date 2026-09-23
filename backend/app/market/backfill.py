@@ -1,7 +1,10 @@
 """Загрузка истории свечей в БД.
 
-Пример:
-    uv run python -m app.market.backfill --symbols BTCUSDT ETHUSDT --tf 60 240 --days 730
+Примеры:
+    uv run python -m app.market.backfill --symbols BTCUSDT ETHUSDT --tf 15 60 240 --days 730
+    uv run python -m app.market.backfill --broker alpaca --symbols AAPL MSFT --tf 15 60 D
+
+Для Bybit история берётся с mainnet (ключи не нужны), для Alpaca нужны TB_ALPACA_API_KEY/SECRET.
 """
 
 import argparse
@@ -9,6 +12,8 @@ import asyncio
 
 import structlog
 
+from app.brokers.alpaca import DATA_URL, PAPER_URL, AlpacaAdapter, AlpacaClient
+from app.brokers.base import BrokerAdapter
 from app.brokers.bybit.adapter import BybitAdapter
 from app.brokers.bybit.client import BybitHttpClient
 from app.config import get_settings
@@ -21,12 +26,27 @@ from app.market.feed import wall_clock_ms
 log = structlog.get_logger()
 
 
-async def backfill(symbols: list[str], tfs: list[Timeframe], days: int, category: str) -> None:
+def make_adapter(broker: str, category: str) -> BrokerAdapter:
+    if broker == "alpaca":
+        s = get_settings()
+        key, secret = s.alpaca_api_key.get_secret_value(), s.alpaca_api_secret.get_secret_value()
+        if not (key and secret):
+            raise SystemExit("для Alpaca задайте TB_ALPACA_API_KEY и TB_ALPACA_API_SECRET")
+        return AlpacaAdapter(
+            AlpacaClient(PAPER_URL, key, secret),
+            AlpacaClient(DATA_URL, key, secret),
+            feed=s.alpaca_feed,
+        )
+    return BybitAdapter(BybitHttpClient(testnet=False), category=category, testnet=False)
+
+
+async def backfill(
+    symbols: list[str], tfs: list[Timeframe], days: int, broker: str, category: str
+) -> None:
     settings = get_settings()
     engine = make_engine(settings.database_url)
-    store = SqlCandleStore(make_sessionmaker(engine), broker="bybit")
-    client = BybitHttpClient(testnet=False)  # история с mainnet полнее, ключи не нужны
-    adapter = BybitAdapter(client, category=category, testnet=False)
+    store = SqlCandleStore(make_sessionmaker(engine), broker=broker)
+    adapter = make_adapter(broker, category)
     try:
         now = wall_clock_ms()
         for symbol in symbols:
@@ -49,10 +69,15 @@ def main() -> None:
     parser.add_argument("--symbols", nargs="+", required=True)
     parser.add_argument("--tf", nargs="+", default=["15", "60", "240"])
     parser.add_argument("--days", type=int, default=730)
+    parser.add_argument("--broker", choices=["bybit", "alpaca"], default="bybit")
     parser.add_argument("--category", default="linear")
     args = parser.parse_args()
     configure_logging(json=False)
-    asyncio.run(backfill(args.symbols, [Timeframe(t) for t in args.tf], args.days, args.category))
+    asyncio.run(
+        backfill(
+            args.symbols, [Timeframe(t) for t in args.tf], args.days, args.broker, args.category
+        )
+    )
 
 
 if __name__ == "__main__":

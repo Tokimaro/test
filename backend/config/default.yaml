@@ -9,11 +9,16 @@ markets:
     symbols: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT]
     timeframes: {higher: "240", working: "60", entry: "15"}
   stocks:
+    # Акции через Alpaca (нужны TB_ALPACA_API_KEY / TB_ALPACA_API_SECRET, есть paper-счёт)
     enabled: false
     market_type: stock
-    category: spot
-    symbols: []
+    broker: alpaca
+    category: stock
+    symbols: [AAPL, MSFT, NVDA, AMZN, SPY]
     timeframes: {higher: "D", working: "60", entry: "15"}
+    allow_short: false
+    gap_risk_pct: 0.005
+    session_buffer_minutes: 15
 
 risk:
   # conservative | moderate | aggressive | custom

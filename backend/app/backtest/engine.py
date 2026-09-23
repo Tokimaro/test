@@ -21,7 +21,7 @@ import pandas as pd
 
 from app.analysis.features import build_features
 from app.analysis.regime import Regime
-from app.domain import Instrument
+from app.domain import Direction, Instrument
 from app.execution.position_logic import (
     ClosePosition,
     CloseReason,
@@ -364,6 +364,7 @@ class _Run:
             atr=Decimal(str(plan.atr)),
             slippage_pct=Decimal(str(self.settings.slippage_pct)),
             derivatives=self.derivatives,
+            gap_risk_pct=Decimal(str(self.bt.market.gap_risk_pct)),
         )
         if not sizing.ok:
             self.stats[f"size_{sizing.reject}"] += 1
@@ -462,6 +463,9 @@ class _Run:
             return
         name = sym.symbol
         if name in self.positions or name in self.pending:
+            return
+        if signal.direction is Direction.SHORT and not self.bt.market.allow_short:
+            self.stats["reject_short_not_allowed"] += 1
             return
         self.stats["signals"] += 1
         corr = self.correlations(sym, i) if self.risk.state.open else None
