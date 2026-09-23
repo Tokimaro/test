@@ -314,6 +314,10 @@ class _Run:
         # 4. TP1 → безубыток; порядок экстремумов по цвету свечи
         if pos.tp1 is not None and not pos.tp1_done and hit(pos.tp1, True):
             self.take_tp1(sym, pos, pos.tp1, ts)
+            # обе цели лежат в «сторону прибыли» и достигаются раньше разворота свечи
+            if name in self.positions and hit(pos.tp2, True):
+                self.close_all(sym, self._slip(pos.tp2, pos, exit_=True), ts, CloseReason.TP2)
+                return
             adverse_after = (close < o) if sign > 0 else (close > o)
             if name in self.positions and adverse_after and hit(pos.stop, favourable=False):
                 price = self._slip(pos.stop, pos, exit_=True)

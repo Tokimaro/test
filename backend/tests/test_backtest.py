@@ -295,3 +295,11 @@ def test_no_edge_on_random_walk() -> None:
     assert s["trades"] >= 50
     assert s["expectancy_r"] < 0.1
     assert isinstance(s["total_return_pct"], float)
+
+
+def test_tp1_and_tp2_in_bearish_bar_takes_tp2_before_reversal() -> None:
+    # медвежья свеча O→H→L→C: обе цели на вершине, затем падение ниже безубытка
+    res = run(manual_symbol([FLAT, FLAT, (101, 110, 99.0, 99.5), FLAT]))
+    (t,) = res.trades
+    assert t.close_reason == "tp2"
+    assert t.r_multiple == pytest.approx(2.25, abs=0.03)
