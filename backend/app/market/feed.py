@@ -26,7 +26,7 @@ class CandleFeed:
         subscriptions: list[tuple[str, Timeframe]],
         handler: CandleHandler,
         *,
-        history_bars: int = 1500,
+        history_bars: int = 2500,
         clock: Callable[[], int] = wall_clock_ms,
     ) -> None:
         self._broker = broker
