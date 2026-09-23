@@ -5,7 +5,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import CandleRow, InstrumentRow
-from app.domain import Candle, Instrument, Timeframe
+from app.domain import Candle, Instrument, MarketType, Timeframe
 
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _MS = timedelta(milliseconds=1)
@@ -147,3 +147,24 @@ class SqlCandleStore:
             )
             for r in rows
         ]
+
+
+async def load_instrument(session: AsyncSession, broker: str, symbol: str) -> Instrument | None:
+    row = await session.scalar(
+        select(InstrumentRow).where(InstrumentRow.broker == broker, InstrumentRow.symbol == symbol)
+    )
+    if row is None:
+        return None
+    return Instrument(
+        symbol=row.symbol,
+        market_type=MarketType(row.market_type),
+        category=row.category,
+        tick_size=row.tick_size,
+        qty_step=row.qty_step,
+        min_qty=row.min_qty,
+        max_qty=row.max_qty,
+        min_notional=row.min_notional,
+        max_leverage=row.max_leverage,
+        taker_fee=row.taker_fee,
+        maker_fee=row.maker_fee,
+    )
