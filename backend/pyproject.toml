@@ -23,6 +23,10 @@ dependencies = [
     "pyotp>=2.9",
 ]
 
+[project.optional-dependencies]
+# чтение датасетов в Parquet для исследований (app.backtest.dataset)
+research = ["pyarrow>=17"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.2",
