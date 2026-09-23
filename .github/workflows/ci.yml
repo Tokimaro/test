@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: tradebot
+          POSTGRES_PASSWORD: tradebot
+          POSTGRES_DB: tradebot_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tradebot"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      TB_TEST_DATABASE_URL: postgresql+asyncpg://tradebot:tradebot@localhost:5432/tradebot_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy app tests
+      - run: uv run pytest -q
