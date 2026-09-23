@@ -70,7 +70,7 @@ def test_weights_sum_to_one() -> None:
 def test_live_mode_guards() -> None:
     with pytest.raises(ValidationError, match="testnet"):
         Settings(_env_file=None, mode=RunMode.LIVE, bybit_testnet=True)
-    with pytest.raises(ValidationError, match="API_KEY"):
+    with pytest.raises(ValidationError, match="JWT"):
         Settings(_env_file=None, mode=RunMode.LIVE, bybit_testnet=False)
     ok = Settings(
         _env_file=None,

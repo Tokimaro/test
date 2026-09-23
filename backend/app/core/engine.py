@@ -708,11 +708,25 @@ class TradingEngine:
             for market_name, broker in {id(b): (m, b) for m, b in self.brokers.items()}.values():
                 try:
                     await broker.cancel_all()
-                    for p in await broker.get_positions():
-                        await broker.close_position(p.symbol)
+                    symbols = [p.symbol for p in await broker.get_positions()]
                 except BrokerError as exc:
                     log.error("engine.kill_failed", market=market_name, error=str(exc))
                     self.bus.publish("alert", level="error", kind="kill_failed", error=str(exc))
+                    # биржа не отдала позиции — всё равно закрываем известные нам
+                    symbols = [s for s, tr in self.tracked.items() if tr.market == market_name]
+                for symbol in symbols:
+                    # одна неудача не должна оставить открытыми остальные позиции
+                    try:
+                        await broker.close_position(symbol)
+                    except BrokerError as exc:
+                        log.error("engine.kill_close_failed", symbol=symbol, error=str(exc))
+                        self.bus.publish(
+                            "alert",
+                            level="error",
+                            kind="kill_failed",
+                            symbol=symbol,
+                            error=str(exc),
+                        )
             await self._reconcile_all()
         self.bus.publish("bot_status", **self.status())
 

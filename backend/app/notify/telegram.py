@@ -55,8 +55,10 @@ class TelegramNotifier:
         bus: EventBus,
         ctx: "AppContext",
         transport: httpx.AsyncBaseTransport | None = None,
+        admin_ids: list[int] | None = None,
     ) -> None:
         self._chat_id = str(chat_id)
+        self._admins = {int(a) for a in admin_ids or []}
         self._bus = bus
         self._ctx = ctx
         self._http = httpx.AsyncClient(
@@ -72,7 +74,9 @@ class TelegramNotifier:
         token = settings.telegram_bot_token.get_secret_value()
         if not token or not settings.telegram_chat_id:
             return None
-        return cls(token, settings.telegram_chat_id, bus, ctx)
+        return cls(
+            token, settings.telegram_chat_id, bus, ctx, admin_ids=settings.telegram_admin_ids
+        )
 
     async def start(self) -> None:
         queue = self._bus.subscribe()
@@ -107,23 +111,38 @@ class TelegramNotifier:
             if text:
                 await self.send(text)
 
+    def authorized(self, msg: dict[str, Any]) -> bool:
+        """Команды — только из заданного чата; в группе — только от админов из списка."""
+        chat = msg.get("chat") or {}
+        if str(chat.get("id")) != self._chat_id:
+            return False
+        if chat.get("type", "private") == "private":
+            return True
+        sender = (msg.get("from") or {}).get("id")
+        return sender is not None and int(sender) in self._admins
+
     async def _poll_commands(self) -> None:
         while True:
             try:
                 resp = await self._http.get(
                     "/getUpdates", params={"offset": self._offset, "timeout": 25}
                 )
-                updates = resp.json().get("result", []) if resp.status_code == 200 else []
+                body = resp.json() if resp.status_code == 200 else {}
+                updates = body.get("result", []) if isinstance(body, dict) else []
             except (httpx.HTTPError, ValueError) as exc:
                 log.warning("telegram.poll_error", error=str(exc))
                 await asyncio.sleep(5)
                 continue
-            for upd in updates:
-                self._offset = max(self._offset, int(upd.get("update_id", 0)) + 1)
-                msg = upd.get("message") or {}
-                if str((msg.get("chat") or {}).get("id")) != self._chat_id:
-                    continue  # чужие чаты игнорируются
-                reply = await self.handle_command(str(msg.get("text", "")).strip())
+            for upd in updates if isinstance(updates, list) else []:
+                try:
+                    self._offset = max(self._offset, int(upd.get("update_id", 0)) + 1)
+                    msg = upd.get("message") or {}
+                    if not self.authorized(msg):
+                        continue
+                    reply = await self.handle_command(str(msg.get("text", "")).strip())
+                except Exception as exc:  # ошибка команды не должна отключать управление
+                    log.exception("telegram.command_failed")
+                    reply = f"⚠ Ошибка выполнения команды: {exc}"
                 if reply:
                     await self.send(reply)
 

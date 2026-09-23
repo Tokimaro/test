@@ -145,3 +145,63 @@ def test_short_jwt_secret_rejected(secret: str) -> None:
 
     with pytest.raises(ValidationError, match="32"):
         Settings(_env_file=None, jwt_secret=SecretStr(secret))
+
+
+def test_group_commands_only_from_admins() -> None:
+    engine = FakeEngine()
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(engine=engine),
+        settings=Settings(_env_file=None, mode=RunMode.PAPER),
+    )
+    n = TelegramNotifier("T", "-100", EventBus(), ctx, admin_ids=[7])  # type: ignore[arg-type]
+    group = {"id": -100, "type": "supergroup"}
+    assert not n.authorized({"chat": group, "from": {"id": 8}})
+    assert n.authorized({"chat": group, "from": {"id": 7}})
+    assert not n.authorized({"chat": {"id": 5, "type": "private"}, "from": {"id": 7}})
+    private = TelegramNotifier("T", "42", EventBus(), ctx)  # type: ignore[arg-type]
+    assert private.authorized({"chat": {"id": 42, "type": "private"}, "from": {"id": 42}})
+
+
+async def test_command_error_does_not_stop_polling() -> None:
+    import asyncio
+
+    sent: list[str] = []
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        if request.url.path.endswith("/getUpdates"):
+            polls += 1
+            if polls > 2:
+                raise httpx.ConnectError("stop")
+            text = "/kill CONFIRM" if polls == 1 else "/status"
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": polls,
+                            "message": {"chat": {"id": 42, "type": "private"}, "text": text},
+                        },
+                    ],
+                },
+            )
+        sent.append(json.loads(request.content)["text"])
+        return httpx.Response(200, json={"ok": True})
+
+    n, engine = make_notifier(handler)
+
+    async def broken_kill() -> None:
+        raise RuntimeError("db down")
+
+    engine.kill_switch = broken_kill  # type: ignore[method-assign]
+    task = asyncio.create_task(n._poll_commands())
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if len(sent) >= 2:
+            break
+    task.cancel()
+    assert "Ошибка" in sent[0]
+    assert sent[1].startswith("Режим")  # после ошибки команды продолжают работать
+    await n._http.aclose()

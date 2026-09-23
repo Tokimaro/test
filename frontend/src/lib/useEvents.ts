@@ -19,13 +19,18 @@ export function useEvents(onEvent?: (e: BusEvent) => void, keep = 50) {
       const token = getToken();
       if (!token) return;
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      ws = new WebSocket(`${proto}://${location.host}/api/ws?token=${encodeURIComponent(token)}`);
+      // токен — первым сообщением, а не в URL (URL попадает в журналы сервера)
+      ws = new WebSocket(`${proto}://${location.host}/api/ws`);
       ws.onopen = () => {
-        setConnected(true);
+        ws?.send(JSON.stringify({ type: "auth", token }));
         retry = 1000;
       };
       ws.onmessage = (msg) => {
         const e = JSON.parse(msg.data) as BusEvent;
+        if (e.type === "auth_ok") {
+          setConnected(true);
+          return;
+        }
         if (e.type === "ping") return;
         handler.current?.(e);
         setEvents((prev) => [e, ...prev].slice(0, keep));

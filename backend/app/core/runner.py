@@ -72,7 +72,15 @@ class BotRuntime:
         key = s.bybit_api_key.get_secret_value()
         secret = s.bybit_api_secret.get_secret_value()
         market_type = MarketType(market.market_type)
-        if s.mode is RunMode.PAPER and not (key and secret):
+        has_keys = bool(key and secret)
+        if s.mode is RunMode.PAPER and has_keys and not s.bybit_testnet:
+            # иначе «paper»-режим отправлял бы настоящие ордера на mainnet
+            raise RuntimeError(
+                "в режиме paper ключи Bybit допустимы только с TB_BYBIT_TESTNET=true"
+            )
+        if s.mode is RunMode.LIVE and not has_keys:
+            raise RuntimeError("режим live требует ключей Bybit (окружение или панель)")
+        if s.mode is RunMode.PAPER and not has_keys:
             data = BybitAdapter(
                 BybitHttpClient(testnet=False),
                 category=market.category,
@@ -169,7 +177,14 @@ class BotRuntime:
             self.feeds[name] = CandleFeed(
                 broker, self.store, subs, engine.on_candle, on_synced=engine.on_backfill
             )
-            await self.feeds[name].sync_all()
+            try:
+                await self.feeds[name].sync_all()
+            except BrokerError as exc:
+                # поток свечей сам повторит загрузку; остальные рынки продолжают работать
+                log.error("runtime.initial_sync_failed", market=name, error=str(exc))
+                self.bus.publish(
+                    "alert", level="error", kind="history_sync_failed", market=name, error=str(exc)
+                )
         for name, feed in self.feeds.items():
             self._tasks.append(asyncio.create_task(self._supervise(f"feed:{name}", feed.run)))
         self._tasks.append(asyncio.create_task(self._supervise("reconcile", self._reconcile_loop)))

@@ -15,7 +15,9 @@
 """
 
 import asyncio
+import contextlib
 import time
+import uuid
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -54,6 +56,8 @@ TIMEFRAMES = {
     Timeframe.D1: "1Day",
 }
 STOP_TYPES = {"stop", "stop_limit", "trailing_stop"}
+ACTIVITY_PAGE = 100
+MAX_ACTIVITY_PAGES = 50
 
 
 def _dec(v: Any, default: str = "0") -> Decimal:
@@ -133,6 +137,7 @@ class AlpacaClient:
 
 class AlpacaAdapter(BrokerAdapter):
     name = "alpaca"
+    supports_split_take_profit = True
 
     def __init__(
         self,
@@ -323,9 +328,11 @@ class AlpacaAdapter(BrokerAdapter):
     async def place_order(self, req: OrderRequest) -> OrderResult:
         if req.qty <= 0 or req.qty != req.qty.to_integral_value():
             raise BrokerError("объём акций должен быть целым и > 0")
-        side = "buy" if req.direction is Direction.LONG else "sell"
         if req.order_type is OrderType.LIMIT and req.reduce_only:
-            return await self._split_take_profit(req)
+            # отдельная лимитка заняла бы объём, зарезервированный стопом, — TP1 передаётся
+            # вместе со входом (partial_take_profit), см. supports_split_take_profit
+            raise BrokerError("Alpaca: TP1 задаётся при входе через partial_take_profit")
+        side = "buy" if req.direction is Direction.LONG else "sell"
         body: dict[str, Any] = {
             "symbol": req.symbol,
             "qty": str(req.qty),
@@ -337,19 +344,11 @@ class AlpacaAdapter(BrokerAdapter):
         if req.order_type is OrderType.LIMIT:
             body["limit_price"] = str(req.price)
         order = await self._t.request("POST", "/v2/orders", json=body)
-        result = _order_result(order)
-        if req.stop_loss is not None and not req.reduce_only:
-            filled = await self._await_fill(order["id"])
-            await self._protect(
-                req.symbol,
-                req.direction,
-                filled.filled_qty,
-                req.stop_loss,
-                req.take_profit,
-                req.link_id,
-            )
-            result = filled
-        return result
+        if req.stop_loss is None or req.reduce_only:
+            return _order_result(order)
+        filled = await self._await_fill(order["id"])
+        await self._protect_or_flatten(req, filled.filled_qty)
+        return filled
 
     async def _await_fill(self, order_id: str) -> OrderResult:
         deadline = time.monotonic() + self._fill_timeout
@@ -360,8 +359,44 @@ class AlpacaAdapter(BrokerAdapter):
             if order["status"] in ("canceled", "expired", "rejected"):
                 raise BrokerError(f"ордер {order_id}: {order['status']}")
             if time.monotonic() > deadline:
+                # не ждём бесконечно: отменяем остаток; исполнившееся всё равно защищаем
+                await self._t.request("DELETE", f"/v2/orders/{order_id}", allow_404=True)
+                order = await self._t.request("GET", f"/v2/orders/{order_id}")
+                if _dec(order.get("filled_qty")) > 0:
+                    return _order_result(order)
                 raise BrokerError(f"ордер {order_id} не исполнился за {self._fill_timeout}s")
             await asyncio.sleep(0.5)
+
+    async def _protect_or_flatten(self, req: OrderRequest, qty: Decimal) -> None:
+        """Ставит защиту на исполненный объём. Не вышло дважды — закрывает позицию:
+        лучше потерять вход, чем держать акции без стопа."""
+        assert req.stop_loss is not None
+        if req.partial_take_profit is not None and req.partial_take_profit[1] < qty:
+            tp1_price, tp1_qty = req.partial_take_profit
+            remaining: list[tuple[Decimal, Decimal | None]] = [
+                (tp1_qty, tp1_price),
+                (qty - tp1_qty, req.take_profit),
+            ]
+        else:
+            remaining = [(qty, req.take_profit)]
+        for attempt in (1, 2):
+            try:
+                while remaining:
+                    tranche_qty, target = remaining[0]
+                    await self._protect(
+                        req.symbol, req.direction, tranche_qty, req.stop_loss, target, req.link_id
+                    )
+                    remaining.pop(0)  # выставленные части при повторе не дублируются
+                return
+            except BrokerError as exc:
+                log.error(
+                    "alpaca.protect_failed", symbol=req.symbol, attempt=attempt, error=str(exc)
+                )
+        await self.cancel_all(req.symbol)
+        with contextlib.suppress(BrokerError):
+            await self._await_no_orders(req.symbol)
+        await self._t.request("DELETE", f"/v2/positions/{req.symbol}", allow_404=True)
+        raise BrokerError(f"{req.symbol}: не удалось выставить стоп — позиция закрыта")
 
     async def _protect(
         self,
@@ -379,7 +414,7 @@ class AlpacaAdapter(BrokerAdapter):
             "qty": str(qty),
             "side": side,
             "time_in_force": "gtc",
-            "client_order_id": f"{link_prefix}-p{int(time.time() * 1000) % 10**8}",
+            "client_order_id": f"{link_prefix}-p{uuid.uuid4().hex[:10]}",
         }
         if take_profit is not None:
             body |= {
@@ -392,23 +427,6 @@ class AlpacaAdapter(BrokerAdapter):
             body |= {"type": "stop", "stop_price": str(stop)}
         await self._t.request("POST", "/v2/orders", json=body)
 
-    async def _split_take_profit(self, req: OrderRequest) -> OrderResult:
-        """TP1: пересобрать защиту в две OCO — (TP1, стоп) на req.qty и (TP2, стоп) на остаток."""
-        positions = {p.symbol: p for p in await self.get_positions()}
-        pos = positions.get(req.symbol)
-        if pos is None:
-            raise BrokerError(f"{req.symbol}: нет позиции для TP1")
-        orders = await self._open_orders(req.symbol)
-        stop = next((_dec(o["stop_price"]) for o in orders if o.get("type") in STOP_TYPES), None)
-        if stop is None:
-            raise BrokerError(f"{req.symbol}: нет стопа — TP1 не выставляется")
-        await self.cancel_all(req.symbol)
-        rest = pos.qty - req.qty
-        await self._protect(req.symbol, pos.direction, req.qty, stop, req.price, req.link_id)
-        if rest > 0:
-            await self._protect(req.symbol, pos.direction, rest, stop, pos.take_profit, req.link_id)
-        return OrderResult(order_id=req.link_id, link_id=req.link_id, status="New")
-
     async def get_order(self, symbol: str, link_id: str) -> OrderResult | None:
         order = await self._t.request(
             "GET",
@@ -419,14 +437,21 @@ class AlpacaAdapter(BrokerAdapter):
         return _order_result(order) if order else None
 
     async def get_closed_pnl(self, symbol: str, since_ms: int) -> list[ClosedPnl]:
-        fills = (
-            await self._t.request(
-                "GET",
-                "/v2/account/activities/FILL",
-                params={"after": _iso(since_ms), "direction": "asc", "page_size": 100},
-            )
-            or []
-        )
+        fills: list[dict[str, Any]] = []
+        token: str | None = None
+        for _ in range(MAX_ACTIVITY_PAGES):
+            params: dict[str, Any] = {
+                "after": _iso(since_ms),
+                "direction": "asc",
+                "page_size": ACTIVITY_PAGE,
+            }
+            if token:
+                params["page_token"] = token
+            page = await self._t.request("GET", "/v2/account/activities/FILL", params=params) or []
+            fills.extend(page)
+            if len(page) < ACTIVITY_PAGE:
+                break
+            token = str(page[-1]["id"])
         qty = Decimal(0)  # со знаком: >0 лонг
         avg = Decimal(0)
         out: list[ClosedPnl] = []
@@ -463,48 +488,76 @@ class AlpacaAdapter(BrokerAdapter):
         stop_loss: Decimal | None = None,
         take_profit: Decimal | None = None,
     ) -> None:
-        if stop_loss is None and take_profit is None:
+        """Переносит стоп на всех защитных ордерах (PATCH). Если стопы покрывают не весь
+        объём (или их нет) — ДОСТАВЛЯЕТ стоп на непокрытую часть, ничего не отменяя:
+        позиция ни на миг не остаётся без защиты. Тейк-профиты не меняются."""
+        if stop_loss is None:
             return
-        orders = await self._open_orders(symbol)
-        stops = [o for o in orders if o.get("type") in STOP_TYPES]
-        if stop_loss is not None and stops:
-            try:
-                for o in stops:
-                    await self._t.request(
-                        "PATCH", f"/v2/orders/{o['id']}", json={"stop_price": str(stop_loss)}
-                    )
-                if take_profit is None:
-                    return
-            except BrokerError as exc:
-                log.warning("alpaca.patch_stop_failed", symbol=symbol, error=str(exc))
-        # нет стопов (восстановление) или замена не удалась — пересобираем защиту целиком
-        positions = {p.symbol: p for p in await self.get_positions()}
+        positions = {p.symbol: p for p in await self.get_positions_raw()}
         pos = positions.get(symbol)
         if pos is None:
             raise BrokerError(f"нет позиции {symbol}")
-        stop = stop_loss if stop_loss is not None else pos.stop_loss
-        if stop is None:
-            raise BrokerError(f"{symbol}: неизвестен уровень стопа")
-        await self.cancel_all(symbol)
-        await self._protect(
-            symbol, pos.direction, pos.qty, stop, take_profit or pos.take_profit, f"amend-{symbol}"
-        )
+        orders = await self._open_orders(symbol)
+        stops = [o for o in orders if o.get("type") in STOP_TYPES]
+        for o in stops:
+            await self._t.request(
+                "PATCH", f"/v2/orders/{o['id']}", json={"stop_price": str(stop_loss)}
+            )
+        uncovered = pos.qty - sum((_dec(o["qty"]) for o in stops), Decimal(0))
+        if uncovered > 0:
+            await self._protect(symbol, pos.direction, uncovered, stop_loss, None, f"fix-{symbol}")
+
+    async def get_positions_raw(self) -> list[Position]:
+        """Позиции без запроса ордеров (стоп/тейк не заполняются)."""
+        raw = await self._t.request("GET", "/v2/positions") or []
+        return [
+            Position(
+                symbol=p["symbol"],
+                direction=Direction.LONG if p.get("side") == "long" else Direction.SHORT,
+                qty=abs(_dec(p["qty"])),
+                entry_price=_dec(p.get("avg_entry_price")),
+                unrealized_pnl=_dec(p.get("unrealized_pl")),
+            )
+            for p in raw
+        ]
 
     async def close_position(self, symbol: str, qty: Decimal | None = None) -> OrderResult | None:
         positions = {p.symbol: p for p in await self.get_positions()}
-        if symbol not in positions:
+        pos = positions.get(symbol)
+        if pos is None:
             return None
-        await self.cancel_all(symbol)  # защитные ордера держат объём — снять перед закрытием
+        # защитные ордера держат объём: снять и дождаться фактической отмены
+        await self.cancel_all(symbol)
+        await self._await_no_orders(symbol)
         params = {"qty": str(qty)} if qty is not None else None
-        order = await self._t.request("DELETE", f"/v2/positions/{symbol}", params=params)
+        try:
+            order = await self._t.request("DELETE", f"/v2/positions/{symbol}", params=params)
+        except BrokerError:
+            if pos.stop_loss is not None:
+                # закрыть не удалось — возвращаем стоп, чтобы позиция не осталась голой
+                await self._protect(
+                    symbol, pos.direction, pos.qty, pos.stop_loss, None, f"restore-{symbol}"
+                )
+            raise
         return _order_result(order) if order else None
+
+    async def _await_no_orders(self, symbol: str, timeout_s: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while await self._open_orders(symbol):
+            if time.monotonic() > deadline:
+                raise BrokerError(f"{symbol}: защитные ордера не отменились за {timeout_s}s")
+            await asyncio.sleep(0.25)
 
     async def cancel_all(self, symbol: str | None = None) -> None:
         if symbol is None:
             await self._t.request("DELETE", "/v2/orders")
             return
         for o in await self._open_orders(symbol):
-            await self._t.request("DELETE", f"/v2/orders/{o['id']}", allow_404=True)
+            try:
+                await self._t.request("DELETE", f"/v2/orders/{o['id']}", allow_404=True)
+            except BrokerError as exc:
+                if exc.code != 422:  # уже отменяется / исполнен — не ошибка
+                    raise
 
 
 def _order_result(o: dict[str, Any]) -> OrderResult:

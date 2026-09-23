@@ -465,3 +465,47 @@ async def test_circuit_breaker_pauses_after_api_errors(
     assert any(e.data.get("kind") == "circuit_breaker" for e in env.events)
     env.engine.resume()
     assert not env.engine.paused and not env.engine.breaker.tripped
+
+
+async def test_kill_switch_continues_after_one_close_fails(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.brokers.base import BrokerError, OrderRequest
+
+    await working_close(env)
+    await env.paper.on_candle("ETHUSDT", Candle(env.clock.now, 10, 10, 10, 10, 1))
+    await env.paper.place_order(
+        OrderRequest(symbol="ETHUSDT", direction=Direction.LONG, qty=Decimal(1), link_id="m")
+    )
+    original = env.paper.close_position
+
+    async def flaky(symbol: str, qty: Decimal | None = None) -> Any:
+        if symbol == "ETHUSDT":
+            raise BrokerError("rejected")
+        return await original(symbol, qty)
+
+    monkeypatch.setattr(env.paper, "close_position", flaky)
+    await env.engine.kill_switch()
+    assert SYMBOL not in env.paper.positions  # несмотря на сбой по ETHUSDT
+    assert any(e.data.get("kind") == "kill_failed" for e in env.events)
+
+
+async def test_split_take_profit_broker_gets_tp1_with_entry(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.brokers.base import OrderRequest
+
+    seen: list[OrderRequest] = []
+    original = env.paper.place_order
+
+    async def spy(req: OrderRequest) -> Any:
+        seen.append(req)
+        return await original(req)
+
+    monkeypatch.setattr(env.paper, "place_order", spy)
+    monkeypatch.setattr(env.paper, "supports_split_take_profit", True)
+    await working_close(env)
+    assert len(seen) == 1  # без отдельной лимитки TP1
+    assert seen[0].partial_take_profit is not None
+    tr = env.engine.tracked[SYMBOL]
+    assert tr.pos.tp1 is not None and tr.tp1_link_id is not None

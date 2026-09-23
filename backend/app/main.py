@@ -70,13 +70,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         app.state.ctx = ctx
         notifier = TelegramNotifier.from_settings(settings, bus, ctx)
+        if notifier is not None:
+            # подписка до старта движка: алерты при запуске тоже должны дойти
+            await notifier.start()
         if settings.run_bot and settings.mode is not RunMode.BACKTEST:
             runtime = BotRuntime(await _with_stored_keys(settings, ctx), trading_config, bus, sm)
-            await runtime.start()
-            ctx.runtime = runtime
-            ctx.config = runtime.config
-        if notifier is not None:
-            await notifier.start()
+            try:
+                await runtime.start()
+            except RuntimeError as exc:
+                # опасная конфигурация: движок не запускаем, но панель остаётся доступной
+                log.error("startup.engine_refused", error=str(exc))
+                bus.publish("alert", level="error", kind="engine_not_started", error=str(exc))
+                await runtime.stop()
+            else:
+                ctx.runtime = runtime
+                ctx.config = runtime.config
         try:
             yield
         finally:

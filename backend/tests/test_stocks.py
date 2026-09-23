@@ -268,87 +268,120 @@ async def test_fractional_qty_rejected() -> None:
         await adapter().place_order(OrderRequest("AAPL", Direction.LONG, Decimal("1.5"), "x"))
 
 
-@respx.mock
-async def test_tp1_splits_protection_into_two_oco() -> None:
-    respx.get(f"{T}/v2/positions").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                {"symbol": "AAPL", "side": "long", "qty": "10", "avg_entry_price": "200"},
-            ],
-        )
-    )
-    respx.get(f"{T}/v2/orders").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                order(id="s1", type="stop", stop_price="195", qty="10"),
-                order(id="l1", type="limit", limit_price="212", qty="10"),
-            ],
-        )
-    )
-    deletes = respx.delete(url__regex=rf"{T}/v2/orders/.+").mock(return_value=httpx.Response(204))
-    posts = respx.post(f"{T}/v2/orders").mock(return_value=httpx.Response(200, json=order()))
+async def test_separate_tp1_limit_rejected() -> None:
     a = adapter()
-    await a.place_order(
+    with pytest.raises(BrokerError, match="partial_take_profit"):
+        await a.place_order(
+            OrderRequest(
+                "AAPL",
+                Direction.SHORT,
+                Decimal(5),
+                "tb1-tp1",
+                order_type=OrderType.LIMIT,
+                price=Decimal(207),
+                reduce_only=True,
+            )
+        )
+
+
+def _filled_entry() -> list[httpx.Response]:
+    return [
+        httpx.Response(
+            200,
+            json=order(
+                id="e1",
+                client_order_id="tb1-entry",
+                status="filled",
+                filled_qty="10",
+                filled_avg_price="200",
+            ),
+        ),
+    ]
+
+
+@respx.mock
+async def test_entry_with_partial_tp_places_two_oco_tranches() -> None:
+    posts = respx.post(f"{T}/v2/orders").mock(return_value=httpx.Response(200, json=order(id="e1")))
+    respx.get(f"{T}/v2/orders/e1").mock(side_effect=_filled_entry())
+    await adapter().place_order(
         OrderRequest(
             "AAPL",
-            Direction.SHORT,
-            Decimal(5),
-            "tb1-tp1",
-            order_type=OrderType.LIMIT,
-            price=Decimal(207),
-            reduce_only=True,
+            Direction.LONG,
+            Decimal(10),
+            "tb1-entry",
+            stop_loss=Decimal(195),
+            take_profit=Decimal(212),
+            partial_take_profit=(Decimal(207), Decimal(5)),
         )
     )
-    assert deletes.call_count == 2
-    bodies = [json.loads(c.request.content) for c in posts.calls]
+    bodies = [json.loads(c.request.content) for c in posts.calls[1:]]
     assert [(b["qty"], b["take_profit"]["limit_price"]) for b in bodies] == [
         ("5", "207"),
         ("5", "212"),
     ]
-    assert all(b["stop_loss"]["stop_price"] == "195" for b in bodies)
+    assert all(b["stop_loss"]["stop_price"] == "195" for b in bodies)  # стоп на весь объём
 
 
 @respx.mock
-async def test_amend_patches_all_stop_legs() -> None:
-    respx.get(f"{T}/v2/orders").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                order(id="s1", type="stop", stop_price="195", qty="5"),
-                order(id="s2", type="stop", stop_price="195", qty="5"),
-                order(id="l1", type="limit", limit_price="212", qty="5"),
-            ],
-        )
-    )
-    patches = respx.patch(url__regex=rf"{T}/v2/orders/s\d").mock(
-        return_value=httpx.Response(200, json={})
-    )
-    await adapter().amend_stops("AAPL", stop_loss=Decimal("200.10"))
-    assert patches.call_count == 2
-    assert json.loads(patches.calls[0].request.content) == {"stop_price": "200.10"}
+async def test_failed_protection_flattens_position() -> None:
+    def post(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("order_class") == "oco":
+            return httpx.Response(422, json={"code": 42210000, "message": "invalid stop"})
+        return httpx.Response(200, json=order(id="e1"))
 
-
-@respx.mock
-async def test_amend_restores_missing_stop() -> None:
+    posts = respx.post(f"{T}/v2/orders").mock(side_effect=post)
+    respx.get(f"{T}/v2/orders/e1").mock(side_effect=_filled_entry())
     respx.get(f"{T}/v2/orders").mock(return_value=httpx.Response(200, json=[]))
-    respx.get(f"{T}/v2/positions").mock(
-        return_value=httpx.Response(
-            200,
-            json=[
-                {"symbol": "AAPL", "side": "short", "qty": "-3", "avg_entry_price": "200"},
-            ],
-        )
+    flatten = respx.delete(f"{T}/v2/positions/AAPL").mock(
+        return_value=httpx.Response(200, json=order())
     )
-    posts = respx.post(f"{T}/v2/orders").mock(return_value=httpx.Response(200, json=order()))
-    await adapter().amend_stops("AAPL", stop_loss=Decimal(205))
-    body = json.loads(posts.calls.last.request.content)
-    assert body == {**body, "type": "stop", "stop_price": "205", "side": "buy", "qty": "3"}
+    with pytest.raises(BrokerError, match="позиция закрыта"):
+        await adapter().place_order(
+            OrderRequest(
+                "AAPL",
+                Direction.LONG,
+                Decimal(10),
+                "tb1-entry",
+                stop_loss=Decimal(195),
+                take_profit=Decimal(212),
+            )
+        )
+    assert flatten.called
+    assert sum(1 for c in posts.calls if b"oco" in c.request.content) == 2  # повтор один раз
 
 
 @respx.mock
-async def test_close_cancels_protection_first() -> None:
+async def test_fill_timeout_protects_partial_fill() -> None:
+    posts = respx.post(f"{T}/v2/orders").mock(return_value=httpx.Response(200, json=order(id="e1")))
+    respx.get(f"{T}/v2/orders/e1").mock(
+        side_effect=[
+            httpx.Response(200, json=order(id="e1", status="partially_filled", filled_qty="4")),
+            httpx.Response(
+                200, json=order(id="e1", status="canceled", filled_qty="4", filled_avg_price="200")
+            ),
+        ]
+    )
+    cancel = respx.delete(f"{T}/v2/orders/e1").mock(return_value=httpx.Response(204))
+    a = AlpacaAdapter(
+        AlpacaClient(T, "K", "S", backoff_s=0), AlpacaClient(D, "K", "S"), fill_timeout_s=0
+    )
+    res = await a.place_order(
+        OrderRequest(
+            "AAPL",
+            Direction.LONG,
+            Decimal(10),
+            "tb1-entry",
+            stop_loss=Decimal(195),
+            take_profit=Decimal(212),
+        )
+    )
+    assert cancel.called and res.filled_qty == 4
+    assert json.loads(posts.calls.last.request.content)["qty"] == "4"
+
+
+@respx.mock
+async def test_amend_patches_stops_and_covers_gap_without_cancelling() -> None:
     respx.get(f"{T}/v2/positions").mock(
         return_value=httpx.Response(
             200,
@@ -361,17 +394,88 @@ async def test_close_cancels_protection_first() -> None:
         return_value=httpx.Response(
             200,
             json=[
-                order(id="s1", type="stop", stop_price="195", qty="10"),
+                order(id="s1", type="stop", stop_price="195", qty="6"),
+                order(id="l1", type="limit", limit_price="212", qty="6"),
             ],
         )
     )
-    cancel = respx.delete(f"{T}/v2/orders/s1").mock(return_value=httpx.Response(204))
-    close = respx.delete(f"{T}/v2/positions/AAPL").mock(
-        return_value=httpx.Response(200, json=order(id="x", status="accepted"))
+    patches = respx.patch(f"{T}/v2/orders/s1").mock(return_value=httpx.Response(200, json={}))
+    posts = respx.post(f"{T}/v2/orders").mock(return_value=httpx.Response(200, json=order()))
+    deletes = respx.delete(url__regex=rf"{T}/v2/orders.*").mock(return_value=httpx.Response(204))
+    await adapter().amend_stops("AAPL", stop_loss=Decimal("200.10"))
+    assert json.loads(patches.calls.last.request.content) == {"stop_price": "200.10"}
+    extra = json.loads(posts.calls.last.request.content)
+    assert extra["type"] == "stop" and extra["qty"] == "4" and extra["stop_price"] == "200.10"
+    assert not deletes.called  # защита ни на миг не снималась
+
+
+@respx.mock
+async def test_close_waits_for_cancellation_and_restores_stop_on_failure() -> None:
+    respx.get(f"{T}/v2/positions").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"symbol": "AAPL", "side": "long", "qty": "10", "avg_entry_price": "200"},
+            ],
+        )
     )
-    await adapter().close_position("AAPL")
-    assert cancel.called and close.called
-    assert respx.calls.index(cancel.calls.last) < respx.calls.index(close.calls.last)
+    stop = order(id="s1", type="stop", stop_price="195", qty="10")
+    respx.get(f"{T}/v2/orders").mock(
+        side_effect=[
+            httpx.Response(200, json=[stop]),  # get_positions
+            httpx.Response(200, json=[stop]),  # cancel_all
+            httpx.Response(200, json=[stop]),  # ещё pending_cancel
+            httpx.Response(200, json=[]),  # отменён
+        ]
+    )
+    respx.delete(f"{T}/v2/orders/s1").mock(return_value=httpx.Response(204))
+    respx.delete(f"{T}/v2/positions/AAPL").mock(
+        return_value=httpx.Response(403, json={"message": "halted"})
+    )
+    restore = respx.post(f"{T}/v2/orders").mock(return_value=httpx.Response(200, json=order()))
+    with pytest.raises(BrokerError):
+        await adapter().close_position("AAPL")
+    body = json.loads(restore.calls.last.request.content)
+    assert body["type"] == "stop" and body["stop_price"] == "195" and body["qty"] == "10"
+
+
+@respx.mock
+async def test_closed_pnl_paginates() -> None:
+    page1 = [
+        {
+            "id": f"a{i}",
+            "symbol": "MSFT",
+            "side": "buy",
+            "qty": "1",
+            "price": "1",
+            "transaction_time": "2026-07-14T14:00:00Z",
+        }
+        for i in range(100)
+    ]
+    page2 = [
+        {
+            "id": "b1",
+            "symbol": "AAPL",
+            "side": "buy",
+            "qty": "2",
+            "price": "100",
+            "transaction_time": "2026-07-14T15:00:00Z",
+        },
+        {
+            "id": "b2",
+            "symbol": "AAPL",
+            "side": "sell",
+            "qty": "2",
+            "price": "90",
+            "transaction_time": "2026-07-14T16:00:00Z",
+        },
+    ]
+    route = respx.get(f"{T}/v2/account/activities/FILL").mock(
+        side_effect=[httpx.Response(200, json=page1), httpx.Response(200, json=page2)]
+    )
+    (c,) = await adapter().get_closed_pnl("AAPL", 0)
+    assert c.pnl == Decimal(-20)
+    assert route.calls.last.request.url.params["page_token"] == "a99"
 
 
 @respx.mock

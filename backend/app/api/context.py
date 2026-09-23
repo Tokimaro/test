@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
@@ -19,28 +18,46 @@ from app.trading_config import TradingConfig
 
 
 class LoginLimiter:
-    """Не более max_failures неудачных входов за window секунд на логин и на IP."""
+    """Ограничение подбора пароля.
 
-    def __init__(self, max_failures: int = 5, window_s: int = 900) -> None:
+    Основной счётчик — по паре (логин, IP): посторонний с другого адреса не может
+    заблокировать владельца. Дополнительный, более мягкий, — по IP (перебор логинов).
+    Размер таблицы ограничен, пустые записи удаляются."""
+
+    MAX_KEYS = 10_000
+
+    def __init__(
+        self, max_failures: int = 5, max_failures_per_ip: int = 20, window_s: int = 900
+    ) -> None:
         self.max = max_failures
+        self.max_ip = max_failures_per_ip
         self.window = window_s
-        self._fails: dict[str, list[float]] = defaultdict(list)
+        self._fails: dict[str, list[float]] = {}
 
-    def _recent(self, key: str) -> list[float]:
+    def _recent(self, key: str) -> int:
         now = time.monotonic()
-        self._fails[key] = [t for t in self._fails[key] if now - t < self.window]
-        return self._fails[key]
+        items = [t for t in self._fails.get(key, ()) if now - t < self.window]
+        if items:
+            self._fails[key] = items
+        else:
+            self._fails.pop(key, None)
+        return len(items)
 
-    def blocked(self, *keys: str) -> bool:
-        return any(len(self._recent(k)) >= self.max for k in keys)
+    def blocked(self, login: str, ip: str) -> bool:
+        return self._recent(f"{login}|{ip}") >= self.max or self._recent(f"ip:{ip}") >= self.max_ip
 
-    def fail(self, *keys: str) -> None:
-        for k in keys:
-            self._fails[k].append(time.monotonic())
+    def fail(self, login: str, ip: str) -> None:
+        if len(self._fails) >= self.MAX_KEYS:
+            # вытесняем самые старые записи, чтобы память не росла бесконечно
+            oldest = sorted(self._fails, key=lambda k: self._fails[k][-1])[: self.MAX_KEYS // 10]
+            for k in oldest:
+                del self._fails[k]
+        now = time.monotonic()
+        for key in (f"{login}|{ip}", f"ip:{ip}"):
+            self._fails.setdefault(key, []).append(now)
 
-    def reset(self, *keys: str) -> None:
-        for k in keys:
-            self._fails.pop(k, None)
+    def reset(self, login: str, ip: str) -> None:
+        self._fails.pop(f"{login}|{ip}", None)
 
 
 @dataclass

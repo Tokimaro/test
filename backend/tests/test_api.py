@@ -208,14 +208,37 @@ async def test_secrets_stored_encrypted(
 def test_websocket_auth_and_events(client: TestClient, seeded: str) -> None:
     from starlette.websockets import WebSocketDisconnect
 
-    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/api/ws?token=bad") as ws:
-        ws.receive_json()
     token = login(client, seeded)["Authorization"].split()[1]
+    # токен в URL больше не принимается (URL попадает в журналы)
+    with (
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect(f"/api/ws?token={token}") as ws,
+    ):
+        ws.send_json({"type": "hello"})
+        ws.receive_json()
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/api/ws") as ws:
+        ws.send_json({"type": "auth", "token": "forged"})
+        ws.receive_json()
     ctx: AppContext = client.app.state.ctx  # type: ignore[attr-defined]
-    with client.websocket_connect(f"/api/ws?token={token}") as ws:
+    with client.websocket_connect("/api/ws") as ws:
+        ws.send_json({"type": "auth", "token": token})
+        assert ws.receive_json() == {"type": "auth_ok"}
         client.portal.call(_publish, ctx)  # type: ignore[union-attr]
         msg = ws.receive_json()
     assert msg["type"] == "alert" and msg["data"]["kind"] == "test"
+
+
+def test_login_limiter_is_per_login_and_ip() -> None:
+    from app.api.context import LoginLimiter
+
+    lim = LoginLimiter(max_failures=3, max_failures_per_ip=5)
+    for _ in range(3):
+        lim.fail("admin", "6.6.6.6")
+    assert lim.blocked("admin", "6.6.6.6")
+    assert not lim.blocked("admin", "1.2.3.4")  # владелец с другого адреса не заблокирован
+    for i in range(5):
+        lim.fail(f"user{i}", "7.7.7.7")
+    assert lim.blocked("anyone", "7.7.7.7")  # перебор логинов с одного IP
 
 
 async def _publish(ctx: AppContext) -> None:

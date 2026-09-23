@@ -60,6 +60,8 @@ class Settings(BaseSettings):
 
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_chat_id: str = ""
+    # В групповом чате команды принимаются только от этих пользователей (id из Telegram)
+    telegram_admin_ids: list[int] = []
 
     @model_validator(mode="after")
     def _live_requires_mainnet_keys(self) -> "Settings":
@@ -69,10 +71,6 @@ class Settings(BaseSettings):
         if self.mode is RunMode.LIVE:
             if self.bybit_testnet:
                 raise ValueError("mode=live несовместим с bybit_testnet=true")
-            if not self.bybit_api_key.get_secret_value() or not (
-                self.bybit_api_secret.get_secret_value()
-            ):
-                raise ValueError("mode=live требует TB_BYBIT_API_KEY и TB_BYBIT_API_SECRET")
             if not self.jwt_secret.get_secret_value():
                 raise ValueError("mode=live требует TB_JWT_SECRET для панели")
         return self

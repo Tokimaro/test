@@ -30,10 +30,14 @@ docker compose exec backend python -m app.api.users create admin   # парол�
 ```
 
 Панель: http://localhost:8000 (порт слушается только на localhost — для доступа извне
-используйте VPN/Tailscale или reverse-proxy с HTTPS).
+используйте VPN/Tailscale или reverse-proxy с HTTPS; за прокси добавьте uvicorn
+`--proxy-headers --forwarded-allow-ips=<IP прокси>`, чтобы защита от подбора пароля видела
+реальные адреса клиентов).
 
 Без ключей API бот работает в режиме **paper на реальных данных Bybit** (локальная симуляция).
 С ключами testnet (`TB_BYBIT_API_KEY/SECRET`, `TB_BYBIT_TESTNET=true`) — на настоящем testnet.
+Ключи mainnet в режиме paper бот не примет (движок не запустится, панель покажет ошибку) —
+чтобы «тестовый» режим никогда не отправил реальные ордера.
 
 ## Типовой сценарий
 
@@ -54,7 +58,8 @@ uv run python -m app.market.backfill --broker alpaca --symbols AAPL MSFT --tf 15
 
 Задайте `TB_TELEGRAM_BOT_TOKEN` (от @BotFather) и `TB_TELEGRAM_CHAT_ID`. Бот присылает сделки и
 алерты и принимает команды **только из этого чата**: `/status`, `/positions`, `/pause`,
-`/resume`, `/kill CONFIRM`.
+`/resume`, `/kill CONFIRM`. Если чат — группа, команды выполняются только от пользователей из
+`TB_TELEGRAM_ADMIN_IDS` (например, `[123456789]`).
 
 ## Разработка
 

@@ -49,6 +49,9 @@ class OrderRequest:
     stop_loss: Decimal | None = None
     take_profit: Decimal | None = None
     reduce_only: bool = False
+    # (цена, объём) частичной фиксации — только для брокеров с supports_split_take_profit:
+    # они сразу ставят защиту двумя частями, без отдельной лимитки TP1
+    partial_take_profit: tuple[Decimal, Decimal] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +79,7 @@ class ClosedPnl:
 
 class BrokerAdapter(ABC):
     name: str
+    supports_split_take_profit: bool = False
 
     @abstractmethod
     def market_type(self) -> MarketType: ...

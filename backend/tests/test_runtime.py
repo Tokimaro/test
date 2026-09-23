@@ -102,3 +102,24 @@ async def test_halted_state_is_loaded_before_first_candle(
         trades = await s.scalar(select(func.count()).select_from(TradeRow))
     assert trades == 0
     assert sig is not None and sig.reject_reason == "halted:kill_switch"
+
+
+def test_paper_mode_refuses_mainnet_keys() -> None:
+    from pydantic import SecretStr
+
+    config = TradingConfig.load(BACKEND_DIR / "config" / "default.yaml")
+    settings = Settings(
+        _env_file=None,
+        mode=RunMode.PAPER,
+        bybit_testnet=False,
+        bybit_api_key=SecretStr("k"),
+        bybit_api_secret=SecretStr("s"),
+    )
+    runtime = BotRuntime(settings, config, EventBus())
+    with pytest.raises(RuntimeError, match="TESTNET"):
+        runtime._make_broker(config.markets["crypto"])
+    live = Settings(
+        _env_file=None, mode=RunMode.LIVE, bybit_testnet=False, jwt_secret=SecretStr("j" * 32)
+    )
+    with pytest.raises(RuntimeError, match="live"):
+        BotRuntime(live, config, EventBus())._make_broker(config.markets["crypto"])

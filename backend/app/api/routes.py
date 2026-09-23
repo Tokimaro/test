@@ -62,8 +62,7 @@ class LoginIn(BaseModel):
 @router.post("/auth/login")
 async def login(body: LoginIn, request: Request, ctx: Ctx) -> dict[str, Any]:
     ip = request.client.host if request.client else "?"
-    keys = (f"login:{body.login}", f"ip:{ip}")
-    if ctx.limiter.blocked(*keys):
+    if ctx.limiter.blocked(body.login, ip):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "слишком много попыток, подождите")
     async with ctx.sm() as s:
         user = await s.scalar(select(UserRow).where(UserRow.login == body.login))
@@ -71,9 +70,9 @@ async def login(body: LoginIn, request: Request, ctx: Ctx) -> dict[str, Any]:
     if ok and user is not None and user.totp_secret:
         ok = verify_totp(user.totp_secret, body.totp)
     if not ok:
-        ctx.limiter.fail(*keys)
+        ctx.limiter.fail(body.login, ip)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "неверный логин, пароль или код 2FA")
-    ctx.limiter.reset(*keys)
+    ctx.limiter.reset(body.login, ip)
     return {"token": ctx.tokens.issue(body.login), "login": body.login}
 
 

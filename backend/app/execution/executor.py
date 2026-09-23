@@ -99,6 +99,16 @@ class OrderExecutor:
         symbol = instrument.symbol
         if derivatives:
             await self.broker.set_leverage(symbol, leverage)
+        tp1_qty = (
+            instrument.round_qty(qty * Decimal(str(tp1_fraction)))
+            if tp1 is not None and tp1_fraction > 0
+            else Decimal(0)
+        )
+        split = (
+            self.broker.supports_split_take_profit
+            and tp1 is not None
+            and instrument.min_qty <= tp1_qty < qty
+        )
         await self.submit(
             trade_id,
             "entry",
@@ -109,9 +119,15 @@ class OrderExecutor:
                 link_id=link_id(trade_id, "entry"),
                 stop_loss=stop,
                 take_profit=take_profit,
+                partial_take_profit=(tp1, tp1_qty) if split and tp1 is not None else None,
             ),
         )
         position = await self._await_position(symbol, direction)
+        if split:
+            # брокер уже выставил TP1 вместе с защитой
+            return EntryFill(position.entry_price, position.qty, link_id(trade_id, "tp1"))
+        if self.broker.supports_split_take_profit:
+            tp1 = None  # отдельная лимитка TP1 у такого брокера заняла бы объём стопа
         # С этого момента позиция существует: любые ошибки ниже не должны её «потерять»
         tp1_link, tp1_error = None, None
         if tp1 is not None and tp1_fraction > 0:
