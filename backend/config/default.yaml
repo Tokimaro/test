@@ -1,0 +1,48 @@
+# Торговая конфигурация по умолчанию (раздел 14 плана).
+# Режим работы и ключи API задаются переменными окружения TB_* (см. .env.example).
+
+markets:
+  crypto:
+    enabled: true
+    market_type: crypto
+    category: linear
+    symbols: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT]
+    timeframes: {higher: "240", working: "60", entry: "15"}
+  stocks:
+    # Акции через Alpaca (нужны TB_ALPACA_API_KEY / TB_ALPACA_API_SECRET, есть paper-счёт)
+    enabled: false
+    market_type: stock
+    broker: alpaca
+    category: stock
+    symbols: [AAPL, MSFT, NVDA, AMZN, SPY]
+    timeframes: {higher: "D", working: "60", entry: "15"}
+    allow_short: false
+    gap_risk_pct: 0.005
+    session_buffer_minutes: 15
+
+risk:
+  # conservative | moderate | aggressive | custom
+  # Для не-custom профиля ключевые значения берутся из пресета (раздел 6.2 плана).
+  profile: moderate
+  losing_streak_cut: 3
+  risk_reduction_factor: 0.5
+  scale_by_confidence: false
+
+strategy:
+  weights:
+    trend: {trend: 0.6, mean_reversion: 0.1, breakout: 0.3}
+    range: {trend: 0.1, mean_reversion: 0.6, breakout: 0.3}
+  stops:
+    sl_atr_min: 1.5
+    sl_atr_max: 3.0
+    tp1_r: 1.5
+    tp1_close_pct: 50
+    tp2_r: 3.0
+    trailing_atr: 3.0
+    min_rr: 2.0
+    min_rr_mean_reversion: 1.5
+    time_stop_bars: 24
+  adx_trend: 25
+  adx_range: 20
+  chaos_volatility_percentile: 95
+  volatility_lookback_days: 90
