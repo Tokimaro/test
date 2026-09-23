@@ -18,6 +18,7 @@ dependencies = [
     "redis>=5.0",
     "numpy>=1.26",
     "pandas>=2.2",
+    "cryptography>=43",
 ]
 
 [dependency-groups]
