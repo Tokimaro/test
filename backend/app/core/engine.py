@@ -38,6 +38,7 @@ from app.execution.position_logic import (
     on_tp1_filled,
 )
 from app.market.store import CandleStore
+from app.risk.circuit import CircuitBreaker
 from app.risk.correlation import correlation_matrix, correlations_for
 from app.risk.manager import RiskEvent, RiskManager
 from app.risk.sizing import size_position
@@ -106,6 +107,7 @@ class TradingEngine:
         self._lock = asyncio.Lock()
         self._unmanaged_alerted: set[str] = set()
         self._bg: set[asyncio.Task[None]] = set()
+        self.breaker = CircuitBreaker()
 
     # ------------------------------------------------------------------ жизненный цикл
     async def start(self) -> None:
@@ -136,6 +138,7 @@ class TradingEngine:
             "open_positions": sum(1 for t in self.tracked.values() if t.confirmed),
             "risk_pct": self.risk.current_risk_pct(),
             "drawdown_pct": round(self.risk.drawdown_pct(), 2),
+            "circuit_breaker": self.breaker.tripped,
         }
 
     async def _symbol_of(self, row: TradeRow) -> str | None:
@@ -149,6 +152,14 @@ class TradingEngine:
         self._bg.add(task)
         task.add_done_callback(self._bg.discard)
         self.bus.publish("alert", level="warning", kind=event.type, details=event.details)
+
+    def _api_error(self, kind: str, **info: Any) -> None:
+        """Учёт сбоев API: серия ошибок ставит торговлю на паузу (circuit breaker)."""
+        now = self.clock()
+        if self.breaker.record(now):
+            self.paused = True
+            self._on_risk_event(RiskEvent(now, "circuit_breaker", {"last_error": kind, **info}))
+            self.bus.publish("bot_status", **self.status())
 
     # ------------------------------------------------------------------ свечи
     async def on_candle(self, event: CandleClosed) -> None:
@@ -361,6 +372,7 @@ class TradingEngine:
             # ордер мог исполниться: держим сделку неподтверждённой, сверка решит её судьбу,
             # а до тех пор новые входы по символу заблокированы
             log.error("engine.entry_uncertain", symbol=symbol, error=str(exc))
+            self._api_error("entry_uncertain", symbol=symbol)
             self.bus.publish(
                 "alert", level="error", kind="entry_uncertain", symbol=symbol, error=str(exc)
             )
@@ -454,6 +466,7 @@ class TradingEngine:
             await broker.amend_stops(symbol, stop_loss=price)
         except BrokerError as exc:
             log.error("engine.move_stop_failed", symbol=symbol, error=str(exc))
+            self._api_error("move_stop_failed", symbol=symbol)
             return
         apply_move(tr.pos, MoveStop(float(price), move.kind))
         await self.repo.update_trade(tr.trade_id, stop_loss=price)
@@ -480,6 +493,7 @@ class TradingEngine:
         except BrokerError as exc:
             tr.pending_reason = None
             log.error("engine.close_failed", symbol=symbol, error=str(exc))
+            self._api_error("close_failed", symbol=symbol)
             self.bus.publish(
                 "alert", level="error", kind="close_failed", symbol=symbol, error=str(exc)
             )
@@ -503,6 +517,7 @@ class TradingEngine:
             positions = {p.symbol: p for p in await broker.get_positions()}
         except BrokerError as exc:
             log.error("engine.reconcile_failed", market=market_name, error=str(exc))
+            self._api_error("reconcile_failed", market=market_name)
             return
         for symbol in list(self.tracked):
             tr = self.tracked.get(symbol)
@@ -529,6 +544,7 @@ class TradingEngine:
                     await broker.amend_stops(symbol, stop_loss=inst.round_price(pos.stop))
                 except BrokerError as exc:
                     log.error("engine.restore_stop_failed", symbol=symbol, error=str(exc))
+                    self._api_error("restore_stop_failed", symbol=symbol)
                     # закрываем; финализация — на следующей сверке (без вложенного вызова)
                     await self.close_trade(symbol, CloseReason.KILL)
         for symbol in positions:
@@ -617,6 +633,7 @@ class TradingEngine:
                 bal = await broker.get_balance()
             except BrokerError as exc:
                 log.warning("engine.balance_unavailable", account=key, error=str(exc))
+                self._api_error("balance_unavailable")
                 return
             equity += bal.equity
             available += bal.available
@@ -653,12 +670,26 @@ class TradingEngine:
         await self.repo.set_state("risk", self.risk.to_dict())
 
     # ------------------------------------------------------------------ управление
+    async def apply_config(self, config: TradingConfig) -> bool:
+        """Применяет новые настройки риска и стратегии на лету.
+        Возвращает True, если изменились инструменты/таймфреймы — нужен перезапуск."""
+        async with self._lock:
+            restart = {n: m.model_dump() for n, m in config.markets.items()} != {
+                n: m.model_dump() for n, m in self.config.markets.items()
+            }
+            self.config = config
+            self.signal_engine = SignalEngine(config.strategy)
+            self.risk.settings = config.risk
+            self.bus.publish("bot_status", **self.status())
+            return restart
+
     def pause(self) -> None:
         self.paused = True
         self.bus.publish("bot_status", **self.status())
 
     def resume(self) -> None:
         self.paused = False
+        self.breaker.reset()
         if self.risk.state.halted:
             self.risk.resume()
         self.bus.publish("bot_status", **self.status())

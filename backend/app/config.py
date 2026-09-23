@@ -56,6 +56,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _live_requires_mainnet_keys(self) -> "Settings":
+        jwt = self.jwt_secret.get_secret_value()
+        if jwt and len(jwt) < 32:
+            raise ValueError("TB_JWT_SECRET должен быть не короче 32 символов")
         if self.mode is RunMode.LIVE:
             if self.bybit_testnet:
                 raise ValueError("mode=live несовместим с bybit_testnet=true")

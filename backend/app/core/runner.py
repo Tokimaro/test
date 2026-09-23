@@ -11,6 +11,7 @@ import contextlib
 from collections.abc import Awaitable, Callable
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.brokers.base import BrokerAdapter
 from app.brokers.bybit.adapter import BybitAdapter
@@ -30,15 +31,26 @@ log = structlog.get_logger()
 
 RECONCILE_INTERVAL_S = 30
 PAPER_STATE_KEY = "paper_broker"
+TRADING_CONFIG_KEY = "trading_config"
 
 
 class BotRuntime:
-    def __init__(self, settings: Settings, config: TradingConfig, bus: EventBus) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        config: TradingConfig,
+        bus: EventBus,
+        sessionmaker: async_sessionmaker[AsyncSession] | None = None,
+    ) -> None:
         self.settings = settings
         self.config = config
         self.bus = bus
-        self.db = make_engine(settings.database_url)
-        self.sm = make_sessionmaker(self.db)
+        # собственное подключение к БД — только если приложение не передало общее
+        self.db: AsyncEngine | None = None
+        if sessionmaker is None:
+            self.db = make_engine(settings.database_url)
+            sessionmaker = make_sessionmaker(self.db)
+        self.sm = sessionmaker
         self.repo = TradeRepo(self.sm, settings.mode.value)
         self.store = SqlCandleStore(self.sm, broker="bybit")
         self.brokers: dict[str, BrokerAdapter] = {}
@@ -73,6 +85,13 @@ class BotRuntime:
         return adapter, adapter
 
     async def start(self) -> None:
+        saved = await self.repo.get_setting(TRADING_CONFIG_KEY)
+        if saved:
+            try:
+                self.config = TradingConfig.from_dict(saved)
+                log.info("runtime.config_from_db")
+            except ValueError as exc:
+                log.error("runtime.saved_config_invalid", error=str(exc))
         instrument_ids: dict[str, int] = {}
         for name, market in self.config.markets.items():
             if not market.enabled or not market.symbols:
@@ -156,5 +175,6 @@ class BotRuntime:
         # PaperBroker.aclose закрывает свой источник данных; для live брокер и есть источник
         for broker in {id(b): b for b in self.brokers.values()}.values():
             await broker.aclose()
-        await self.db.dispose()
+        if self.db is not None:
+            await self.db.dispose()
         log.info("runtime.stopped")

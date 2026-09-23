@@ -448,3 +448,20 @@ async def test_restart_with_pending_trade_adopts_filled_position(
     (t,) = await trades(env)
     assert t.status == "open"
     assert restarted.engine.tracked[SYMBOL].confirmed
+
+
+async def test_circuit_breaker_pauses_after_api_errors(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.brokers.base import BrokerError
+
+    async def down() -> Any:
+        raise BrokerError("503")
+
+    monkeypatch.setattr(env.paper, "get_positions", down)
+    for _ in range(env.engine.breaker.max_errors):
+        await env.engine.reconcile()
+    assert env.engine.paused and env.engine.breaker.tripped
+    assert any(e.data.get("kind") == "circuit_breaker" for e in env.events)
+    env.engine.resume()
+    assert not env.engine.paused and not env.engine.breaker.tripped

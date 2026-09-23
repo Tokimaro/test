@@ -78,7 +78,7 @@ def test_live_mode_guards() -> None:
         bybit_testnet=False,
         bybit_api_key=SecretStr("k"),
         bybit_api_secret=SecretStr("s"),
-        jwt_secret=SecretStr("j"),
+        jwt_secret=SecretStr("j" * 32),
     )
     assert ok.mode is RunMode.LIVE
 
