@@ -103,6 +103,7 @@ class TradingEngine:
         self.tracked: dict[str, Tracked] = {}
         self.paused = False
         self.btc_regime: Regime | None = None
+        self.btc_long_trend: int | None = None
         self.last_signal: dict[str, Signal] = {}
         self._lock = asyncio.Lock()
         self._unmanaged_alerted: set[str] = set()
@@ -209,6 +210,7 @@ class TradingEngine:
         signal = self.signal_engine.evaluate_last(feats, symbol, ctx)
         if symbol == "BTCUSDT":
             self.btc_regime = signal.regime
+            self.btc_long_trend = int(feats["long_trend"].iloc[-1])
         self.last_signal[symbol] = signal
         row = Row(columns_of(feats), len(feats) - 1)
 
@@ -262,7 +264,10 @@ class TradingEngine:
         except BrokerError as exc:
             log.warning("engine.funding_unavailable", symbol=symbol, error=str(exc))
         return MarketContext(
-            funding_rate=funding, btc_regime=self.btc_regime, is_btc=symbol == "BTCUSDT"
+            funding_rate=funding,
+            btc_regime=self.btc_regime,
+            market_trend=self.btc_long_trend,
+            is_btc=symbol == "BTCUSDT",
         )
 
     # ------------------------------------------------------------------ вход

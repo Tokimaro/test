@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from app.analysis.regime import Regime, classify_regime, higher_tf_bias
+from app.analysis.regime import Regime, classify_regime, higher_tf_bias, long_trend
 from app.domain import Direction
 from app.strategy.base import MarketContext, Row, Strategy, SubSignal, clamp, columns_of
 from app.strategy.breakout import BreakoutStrategy
@@ -44,6 +44,7 @@ def prepare(feats: pd.DataFrame, cfg: StrategySettings) -> pd.DataFrame:
     out = feats.copy()
     out["regime"] = classify_regime(out, cfg)
     out["h_bias"] = higher_tf_bias(out)
+    out["long_trend"] = long_trend(out)
     return out
 
 
@@ -107,7 +108,7 @@ class SignalEngine:
         else:
             mtf = MTF_AGAINST
 
-        filters = self._filters(side, ctx)
+        filters = self._filters(side, ctx, int(row["long_trend"]))
         filt_mult = float(np.prod(list(filters.values()))) if filters else 1.0
         final = raw * mtf * filt_mult
 
@@ -121,6 +122,7 @@ class SignalEngine:
             "raw": round(raw, 4),
             "mtf": mtf,
             "h_bias": bias,
+            "long_trend": int(row["long_trend"]),
             "filters": filters,
             "weights": weights,
             "scores": {s.name: round(s.score, 4) for s in subs},
@@ -130,11 +132,18 @@ class SignalEngine:
             ts, symbol, direction, round(abs(final) * 100, 2), regime, dominant, components
         )
 
-    @staticmethod
-    def _filters(side: int, ctx: MarketContext | None) -> dict[str, float]:
-        if ctx is None or side == 0:
+    def _filters(self, side: int, ctx: MarketContext | None, own_trend: int) -> dict[str, float]:
+        if side == 0:
             return {}
         out: dict[str, float] = {}
+        # прогноз против долгосрочного тренда самой монеты — уверенность ниже
+        if own_trend == -side:
+            out["counter_trend"] = self.cfg.counter_trend_penalty
+        if ctx is None:
+            return out
+        # ...и против тренда всего рынка (BTC) — для альткоинов
+        if not ctx.is_btc and ctx.market_trend == -side:
+            out["market_trend"] = self.cfg.market_trend_penalty
         if ctx.funding_rate is not None:
             # экстремальный funding в сторону сделки = перегретая толпа → штраф
             f = ctx.funding_rate * side

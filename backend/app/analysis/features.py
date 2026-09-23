@@ -81,12 +81,18 @@ def _value_at_swing(values: pd.Series, swing: pd.Series, right: int = 3) -> pd.S
     return at_pivot.ffill()
 
 
-def higher_features(df: pd.DataFrame) -> pd.DataFrame:
+def higher_features(
+    df: pd.DataFrame, tf: Timeframe = Timeframe.H4, long_trend_days: int = 200
+) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     out["close"] = df["close"]
     out["ema200"] = ind.ema(df["close"], 200)
     out["ema50"] = ind.ema(df["close"], 50)
     out["atr"] = ind.atr(df, 14)
+    # долгосрочный тренд: EMA за long_trend_days и её изменение за 30 дней
+    bars_per_day = max(1, 86_400 // tf.seconds)
+    out["ema_long"] = ind.ema(df["close"], long_trend_days * bars_per_day)
+    out["ema_long_slope"] = out["ema_long"].diff(30 * bars_per_day)
     return out
 
 
@@ -109,10 +115,9 @@ def build_features(
     cfg: StrategySettings,
 ) -> pd.DataFrame:
     feats = working_features(working, working_tf, cfg)
-    hf = higher_features(higher)
-    feats = feats.join(
-        align_closed(feats, working_tf, hf, higher_tf, ["close", "ema200", "ema50", "atr"], "h_")
-    )
+    hf = higher_features(higher, higher_tf, cfg.long_trend_days)
+    cols = ["close", "ema200", "ema50", "atr", "ema_long", "ema_long_slope"]
+    feats = feats.join(align_closed(feats, working_tf, hf, higher_tf, cols, "h_"))
     if entry is not None and entry_tf is not None and not entry.empty:
         ef = entry_features(entry)
         feats = feats.join(

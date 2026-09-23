@@ -57,3 +57,16 @@ def higher_tf_bias(feats: pd.DataFrame, neutral_atr: float = 0.5) -> pd.Series:
         bias = np.where(diff > neutral_atr * atr, 1, np.where(diff < -neutral_atr * atr, -1, 0))
     bias = np.where(np.isnan(diff) | np.isnan(atr), 0, bias)
     return pd.Series(bias, index=feats.index, name="h_bias", dtype="int64")
+
+
+def long_trend(feats: pd.DataFrame) -> pd.Series:
+    """Долгосрочный тренд: +1 — цена выше растущей длинной EMA, -1 — ниже падающей,
+    0 — нейтрально (сигналы разнонаправлены или мало истории)."""
+    close = feats["h_close"].to_numpy()
+    ema = feats["h_ema_long"].to_numpy()
+    slope = feats["h_ema_long_slope"].to_numpy()
+    with np.errstate(invalid="ignore"):
+        up = (close > ema) & (slope > 0)
+        down = (close < ema) & (slope < 0)
+    trend = np.where(up, 1, np.where(down, -1, 0))
+    return pd.Series(trend, index=feats.index, name="long_trend", dtype="int64")

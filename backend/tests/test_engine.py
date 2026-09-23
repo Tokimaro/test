@@ -38,6 +38,7 @@ RAW = TradingConfig.load(BACKEND_DIR / "config" / "default.yaml").model_dump(mod
 RAW["markets"] = {
     "crypto": {**RAW["markets"]["crypto"], "symbols": [SYMBOL]},
 }
+RAW["strategy"]["stops"]["time_stop_bars"] = 24  # тесты тайм-стопа включают его явно
 CONFIG = TradingConfig.from_dict(RAW)
 
 

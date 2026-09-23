@@ -41,8 +41,14 @@ strategy:
     trailing_atr: 3.0
     min_rr: 2.0
     min_rr_mean_reversion: 1.5
-    time_stop_bars: 24
+    time_stop_bars: 0  # 0 — без тайм-стопа: только тейк-профит или стоп
   adx_trend: 25
   adx_range: 20
   chaos_volatility_percentile: 95
   volatility_lookback_days: 90
+  # тренд рынка: прогноз против 200-дневного тренда монеты — уверенность ×0.75,
+  # против тренда BTC (для альткоинов) — ×0.85. 1.0 — фильтр выключен.
+  # Значение 0.5 при пороге 65% уже равносильно запрету сделок против тренда.
+  long_trend_days: 200
+  counter_trend_penalty: 0.75
+  market_trend_penalty: 0.85

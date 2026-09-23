@@ -123,7 +123,7 @@ def on_bar_close(
     pos.bars_held += 1
     # Тайм-стоп: сделка так и не дошла до первой цели
     first_target_reached = pos.tp1_done if pos.tp1 is not None else False
-    if not first_target_reached and pos.bars_held >= cfg.time_stop_bars:
+    if cfg.time_stop_bars and not first_target_reached and pos.bars_held >= cfg.time_stop_bars:
         return [ClosePosition(CloseReason.TIME)]
 
     if pos.trailing_active():

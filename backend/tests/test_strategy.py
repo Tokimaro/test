@@ -47,6 +47,7 @@ BASE: dict[str, Any] = {
     "e_ema21": NAN,
     "regime": "trend_up",
     "h_bias": 1,
+    "long_trend": 0,
 }
 
 
@@ -191,6 +192,26 @@ class TestEnsemble:
         own = MarketContext(btc_regime=Regime.TREND_DOWN, is_btc=True)
         assert (
             self.engine.evaluate_row(self.perfect_trend_row(), 0, "BTCUSDT", own).confidence == 100
+        )
+
+    def test_counter_trend_penalties(self) -> None:
+        # лонг против падающего долгосрочного тренда монеты — уверенность ×0.75
+        own = self.engine.evaluate_row(self.perfect_trend_row(long_trend=-1), 0, "ETHUSDT")
+        assert own.components["filters"] == {"counter_trend": 0.75}
+        assert own.confidence == pytest.approx(75.0)
+        # по тренду — без штрафа
+        assert (
+            self.engine.evaluate_row(self.perfect_trend_row(long_trend=1), 0, "X").confidence == 100
+        )
+        # против тренда всего рынка (BTC) — ×0.85, к самому BTC не применяется
+        ctx = MarketContext(market_trend=-1)
+        mkt = self.engine.evaluate_row(self.perfect_trend_row(), 0, "ETHUSDT", ctx)
+        assert mkt.components["filters"] == {"market_trend": 0.85}
+        both = self.engine.evaluate_row(self.perfect_trend_row(long_trend=-1), 0, "SOL", ctx)
+        assert both.confidence == pytest.approx(100 * 0.75 * 0.85)
+        btc = MarketContext(market_trend=-1, is_btc=True)
+        assert (
+            self.engine.evaluate_row(self.perfect_trend_row(), 0, "BTCUSDT", btc).confidence == 100
         )
 
     def test_transition_uses_blended_weights(self) -> None:

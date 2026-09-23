@@ -147,11 +147,19 @@ def test_signal_invalidated_by_gap_is_skipped() -> None:
     assert res.signal_stats.get("skip_gap") == 1
 
 
-def test_time_stop() -> None:
-    res = run(manual_symbol([FLAT] * 40))
+def test_time_stop_optional() -> None:
+    # по умолчанию тайм-стопа нет: сделка идёт до стопа/цели (здесь — до конца данных)
+    assert CONFIG.strategy.stops.time_stop_bars == 0
+    assert run(manual_symbol([FLAT] * 40)).trades[0].close_reason == "end"
+    raw = CONFIG.model_dump(mode="json")
+    raw["strategy"]["stops"]["time_stop_bars"] = 24
+    cfg = TradingConfig.from_dict(raw)
+    res = Backtester(cfg, MARKET, BacktestSettings(slippage_pct=0, funding_rate_8h=0)).run(
+        [manual_symbol([FLAT] * 40)]
+    )
     (t,) = res.trades
     assert t.close_reason == "time"
-    assert t.bars_held == CONFIG.strategy.stops.time_stop_bars
+    assert t.bars_held == 24
 
 
 def test_short_mirror() -> None:

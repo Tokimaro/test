@@ -136,6 +136,7 @@ class Backtester:
 
         btc = frames.get("BTCUSDT")
         btc_regime = btc["regime"] if btc is not None else None
+        btc_trend = btc["long_trend"] if btc is not None else None
 
         out = []
         for d in data:
@@ -148,8 +149,10 @@ class Backtester:
                 if btc_regime is not None:
                     ts = int(index[i])
                     btc_r = btc_regime.get(ts)
+                    btc_t = btc_trend.get(ts) if btc_trend is not None else None
                     ctx = MarketContext(
                         btc_regime=Regime(btc_r) if isinstance(btc_r, str) else None,
+                        market_trend=int(btc_t) if btc_t is not None else None,
                         is_btc=d.symbol == "BTCUSDT",
                     )
                 signals.append(self.engine.evaluate_row(Row(cols, i), int(index[i]), d.symbol, ctx))

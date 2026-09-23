@@ -20,6 +20,7 @@ class MarketContext:
 
     funding_rate: float | None = None  # ставка финансирования за 8ч (0.0001 = 0.01%)
     btc_regime: Regime | None = None  # режим BTC — для фильтра альткоинов
+    market_trend: int | None = None  # долгосрочный тренд BTC: +1 / 0 / -1
     is_btc: bool = False
 
 

@@ -150,7 +150,8 @@ class StopSettings(_Model):
     trailing_atr: float = Field(3.0, gt=0)
     min_rr: float = Field(2.0, gt=0)
     min_rr_mean_reversion: float = Field(1.5, gt=0)
-    time_stop_bars: int = Field(24, ge=1)
+    # 0 — тайм-стоп выключен: сделка всегда завершается тейк-профитом или стопом
+    time_stop_bars: int = Field(0, ge=0)
 
     @model_validator(mode="after")
     def _ordered(self) -> Self:
@@ -169,6 +170,12 @@ class StrategySettings(_Model):
     chaos_volatility_percentile: float = Field(95.0, gt=50, le=100)
     volatility_lookback_days: int = Field(90, ge=10)
     max_spread_pct: float = Field(0.1, gt=0)
+    # Долгосрочный тренд: EMA за long_trend_days на старшем ТФ + её наклон за 30 дней.
+    # Прогноз против тренда монеты / всего рынка (BTC) снижает уверенность множителем.
+    long_trend_days: int = Field(200, ge=20, le=400)
+    # 0.5 при пороге 65% фактически запрещает сделки против тренда (100% × 0.5 < 65%)
+    counter_trend_penalty: float = Field(0.75, ge=0, le=1)
+    market_trend_penalty: float = Field(0.85, ge=0, le=1)
 
     @model_validator(mode="after")
     def _adx(self) -> Self:
