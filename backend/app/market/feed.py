@@ -12,6 +12,7 @@ from app.market.store import CandleStore
 log = structlog.get_logger()
 
 CandleHandler = Callable[[CandleClosed], Awaitable[None]]
+SyncedHandler = Callable[[str, Timeframe, list[Candle]], Awaitable[None]]
 
 
 def wall_clock_ms() -> int:
@@ -28,6 +29,7 @@ class CandleFeed:
         *,
         history_bars: int = 2500,
         clock: Callable[[], int] = wall_clock_ms,
+        on_synced: SyncedHandler | None = None,
     ) -> None:
         self._broker = broker
         self._store = store
@@ -35,6 +37,7 @@ class CandleFeed:
         self._handler = handler
         self._history_bars = history_bars
         self._clock = clock
+        self._on_synced = on_synced
         self._last: dict[tuple[str, Timeframe], int] = {}
 
     async def run(self) -> None:
@@ -68,6 +71,12 @@ class CandleFeed:
             await self._store.save_candles(symbol, tf, closed)
             self._last[key] = closed[-1].ts
             log.info("feed.synced", symbol=symbol, tf=tf.value, bars=len(closed))
+            if self._on_synced is not None and last is not None:
+                # докачка пропуска (не первичная загрузка истории)
+                try:
+                    await self._on_synced(symbol, tf, closed)
+                except Exception:
+                    log.exception("feed.on_synced_failed", symbol=symbol, tf=tf.value)
             await self._emit_if_fresh(symbol, tf, closed[-1], now)
         elif last is not None:
             self._last[key] = last

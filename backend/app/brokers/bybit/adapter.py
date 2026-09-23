@@ -94,6 +94,9 @@ class BybitAdapter(BrokerAdapter):
     def market_type(self) -> MarketType:
         return self._market_type
 
+    def account_key(self) -> str:
+        return f"bybit:{self._client.account_key}"
+
     @property
     def category(self) -> str:
         return self._category

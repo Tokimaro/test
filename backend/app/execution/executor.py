@@ -17,6 +17,8 @@ from app.domain import Direction, Instrument, Position
 
 log = structlog.get_logger()
 
+DUPLICATE_LINK_ID = 110072
+
 
 class OrderUncertain(BrokerError):
     """Судьба ордера неизвестна (биржа недоступна) — решит сверка позиций."""
@@ -27,6 +29,7 @@ class EntryFill:
     entry_price: Decimal
     qty: Decimal
     tp1_link_id: str | None
+    tp1_error: str | None = None  # вход состоялся, но TP1 выставить не удалось
 
 
 def link_id(trade_id: int, purpose: str) -> str:
@@ -67,6 +70,11 @@ class OrderExecutor:
                 await self.repo.update_order(req.link_id, "unknown")
                 raise OrderUncertain(f"{req.link_id}: {exc}; проверка: {lookup_exc}") from exc
             if existing is None:
+                if exc.code is None or exc.code == DUPLICATE_LINK_ID:
+                    # ответ потерян (сеть) или биржа видит дубль, но ордер пока не находится:
+                    # исход неизвестен — отказом это считать нельзя
+                    await self.repo.update_order(req.link_id, "unknown")
+                    raise OrderUncertain(f"{req.link_id}: {exc}") from exc
                 await self.repo.update_order(req.link_id, "rejected")
                 raise
             log.warning("executor.recovered_order", link_id=req.link_id, error=str(exc))
@@ -104,25 +112,30 @@ class OrderExecutor:
             ),
         )
         position = await self._await_position(symbol, direction)
-        tp1_link = None
+        # С этого момента позиция существует: любые ошибки ниже не должны её «потерять»
+        tp1_link, tp1_error = None, None
         if tp1 is not None and tp1_fraction > 0:
             tp1_qty = instrument.round_qty(position.qty * Decimal(str(tp1_fraction)))
             if instrument.min_qty <= tp1_qty < position.qty:
-                tp1_link = link_id(trade_id, "tp1")
-                await self.submit(
-                    trade_id,
-                    "tp1",
-                    OrderRequest(
-                        symbol=symbol,
-                        direction=direction.opposite,
-                        qty=tp1_qty,
-                        link_id=tp1_link,
-                        order_type=OrderType.LIMIT,
-                        price=tp1,
-                        reduce_only=True,
-                    ),
-                )
-        return EntryFill(position.entry_price, position.qty, tp1_link)
+                try:
+                    await self.submit(
+                        trade_id,
+                        "tp1",
+                        OrderRequest(
+                            symbol=symbol,
+                            direction=direction.opposite,
+                            qty=tp1_qty,
+                            link_id=link_id(trade_id, "tp1"),
+                            order_type=OrderType.LIMIT,
+                            price=tp1,
+                            reduce_only=True,
+                        ),
+                    )
+                    tp1_link = link_id(trade_id, "tp1")
+                except BrokerError as exc:
+                    log.error("executor.tp1_failed", symbol=symbol, error=str(exc))
+                    tp1_error = str(exc)
+        return EntryFill(position.entry_price, position.qty, tp1_link, tp1_error)
 
     async def _await_position(self, symbol: str, direction: Direction) -> Position:
         """Позиция появляется на бирже не мгновенно — ждём подтверждения."""

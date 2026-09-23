@@ -100,6 +100,11 @@ class BybitHttpClient:
         )
 
     @property
+    def account_key(self) -> str:
+        base = str(self._http.base_url)
+        return f"{base}:{self._api_key}" if self._api_key else f"{base}:public:{id(self)}"
+
+    @property
     def has_credentials(self) -> bool:
         return bool(self._api_key and self._api_secret)
 

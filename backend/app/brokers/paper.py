@@ -23,6 +23,7 @@ from app.brokers.base import (
 from app.domain import Balance, Candle, Direction, Instrument, MarketType, Position, Timeframe
 
 DUPLICATE_LINK_ID = 110072  # как у Bybit: повтор orderLinkId
+CLOSED_HISTORY = 500  # сколько последних закрытий хранить в сериализованном состоянии
 
 
 @dataclass
@@ -33,6 +34,7 @@ class _Pos:
     stop: Decimal | None = None
     take_profit: Decimal | None = None
     open_fees: Decimal = Decimal(0)  # комиссия входа, ещё не отнесённая на закрытия
+    opened_at: int = 0  # мс; свечи, закончившиеся до входа, не могут задеть стоп
 
 
 @dataclass
@@ -66,6 +68,8 @@ class PaperBroker(BrokerAdapter):
         self.orders: dict[str, OrderResult] = {}
         self.closed: list[ClosedPnl] = []
         self.last_price: dict[str, Decimal] = {}
+        self.last_price_ts: dict[str, int] = {}
+        self.last_candle_end: dict[str, int] = {}
         self._seq = 0
 
     # ------------------------------------------------------------------ данные
@@ -216,12 +220,28 @@ class PaperBroker(BrokerAdapter):
                 )
 
     # ------------------------------------------------------------------ симуляция
-    async def on_candle(self, symbol: str, candle: Candle) -> None:
-        """Обновляет цену и проверяет срабатывание стопов/целей/лимиток по свече."""
+    def mark_price(self, symbol: str, price: float, ts: int) -> None:
+        """Обновляет последнюю цену без проверки стопов (например, закрытие рабочей свечи)."""
+        if ts >= self.last_price_ts.get(symbol, -1):
+            self.last_price[symbol] = Decimal(str(price))
+            self.last_price_ts[symbol] = ts
+
+    async def on_candle(self, symbol: str, candle: Candle, tf_ms: int = 0) -> None:
+        """Проверяет срабатывание стопов/целей/лимиток по свече и обновляет цену.
+
+        Идемпотентно: свеча, уже обработанная (по времени окончания), игнорируется —
+        поэтому докачанные после обрыва свечи можно безопасно «проигрывать» повторно.
+        """
+        end = candle.ts + tf_ms
+        if end <= self.last_candle_end.get(symbol, -1):
+            return
+        self.last_candle_end[symbol] = end
         high, low = Decimal(str(candle.high)), Decimal(str(candle.low))
         o = Decimal(str(candle.open))
         pos = self.positions.get(symbol)
-        inst = await self.get_instrument(symbol) if (pos or self._limits_for(symbol)) else None
+        if pos is not None and pos.opened_at >= end:
+            pos = None  # свеча целиком до входа — её экстремумы к позиции не относятся
+        inst = await self.get_instrument(symbol) if pos is not None else None
         if pos is not None and inst is not None:
             sign = pos.direction.sign
             if pos.stop is not None and (low <= pos.stop if sign > 0 else high >= pos.stop):
@@ -280,7 +300,7 @@ class PaperBroker(BrokerAdapter):
                         reduce_only=True,
                     )
                     self._drop_reduce_limits(symbol)
-        self.last_price[symbol] = Decimal(str(candle.close))
+        self.mark_price(symbol, candle.close, end)
 
     def _limits_for(self, symbol: str) -> list[_Limit]:
         return [lim for lim in self.limits.values() if lim.symbol == symbol]
@@ -311,7 +331,9 @@ class PaperBroker(BrokerAdapter):
                 raise BrokerError("reduce-only ордер без позиции")
             fee = price * qty * fee_rate
             if pos is None:
-                self.positions[symbol] = _Pos(direction, qty, price, open_fees=fee)
+                self.positions[symbol] = _Pos(
+                    direction, qty, price, open_fees=fee, opened_at=self._clock()
+                )
             else:
                 total = pos.qty + qty
                 pos.entry = (pos.entry * pos.qty + price * qty) / total
@@ -360,6 +382,7 @@ class PaperBroker(BrokerAdapter):
                     "stop": str(p.stop) if p.stop is not None else None,
                     "take_profit": str(p.take_profit) if p.take_profit is not None else None,
                     "open_fees": str(p.open_fees),
+                    "opened_at": p.opened_at,
                 }
                 for s, p in self.positions.items()
             },
@@ -375,6 +398,20 @@ class PaperBroker(BrokerAdapter):
                 for k, v in self.limits.items()
             },
             "order_ids": {k: v.order_id for k, v in self.orders.items()},
+            "closed": [
+                {
+                    "symbol": c.symbol,
+                    "qty": str(c.qty),
+                    "avg_entry": str(c.avg_entry),
+                    "avg_exit": str(c.avg_exit),
+                    "pnl": str(c.pnl),
+                    "ts": c.ts,
+                }
+                for c in self.closed[-CLOSED_HISTORY:]
+            ],
+            "last_price": {s: str(v) for s, v in self.last_price.items()},
+            "last_price_ts": dict(self.last_price_ts),
+            "last_candle_end": dict(self.last_candle_end),
         }
 
     def load_dict(self, d: dict[str, Any]) -> None:
@@ -391,6 +428,7 @@ class PaperBroker(BrokerAdapter):
                 dec(p.get("stop")),
                 dec(p.get("take_profit")),
                 Decimal(p.get("open_fees", "0")),
+                int(p.get("opened_at", 0)),
             )
             for s, p in d.get("positions", {}).items()
         }
@@ -410,3 +448,17 @@ class PaperBroker(BrokerAdapter):
             k: OrderResult(oid, k, status="New" if k in self.limits else "Filled")
             for k, oid in d.get("order_ids", {}).items()
         }
+        self.closed = [
+            ClosedPnl(
+                symbol=c["symbol"],
+                qty=Decimal(c["qty"]),
+                avg_entry=Decimal(c["avg_entry"]),
+                avg_exit=Decimal(c["avg_exit"]),
+                pnl=Decimal(c["pnl"]),
+                ts=int(c["ts"]),
+            )
+            for c in d.get("closed", [])
+        ]
+        self.last_price = {s: Decimal(v) for s, v in d.get("last_price", {}).items()}
+        self.last_price_ts = {s: int(v) for s, v in d.get("last_price_ts", {}).items()}
+        self.last_candle_end = {s: int(v) for s, v in d.get("last_candle_end", {}).items()}

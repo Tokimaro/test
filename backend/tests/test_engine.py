@@ -297,3 +297,154 @@ async def test_unmanaged_position_alert(env: Env) -> None:
     await env.engine.reconcile()
     alerts = [e for e in env.events if e.data.get("kind") == "unmanaged_position"]
     assert len(alerts) == 1
+
+
+# ------------------------------------------------------------------ регрессии по код-ревью
+async def test_tp1_failure_keeps_position_tracked(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.brokers.base import BrokerError, OrderRequest, OrderType
+
+    original = env.paper.place_order
+
+    async def no_limits(req: OrderRequest) -> Any:
+        if req.order_type is OrderType.LIMIT:
+            raise BrokerError("price out of range", code=110003)
+        return await original(req)
+
+    monkeypatch.setattr(env.paper, "place_order", no_limits)
+    await working_close(env)
+    (t,) = await trades(env)
+    assert t.status == "open"
+    tr = env.engine.tracked[SYMBOL]
+    assert tr.confirmed and tr.pos.tp1 is None and tr.pos.trailing_active()
+    assert SYMBOL in env.engine.risk.state.open
+    assert any(e.data.get("kind") == "tp1_failed" for e in env.events)
+
+
+async def test_unmanaged_exchange_position_blocks_entry(env: Env) -> None:
+    from app.brokers.base import OrderRequest
+
+    await env.paper.place_order(
+        OrderRequest(symbol=SYMBOL, direction=Direction.SHORT, qty=Decimal("0.01"), link_id="m")
+    )
+    await working_close(env)
+    assert await trades(env) == []
+    async with env.sm() as s:
+        sig = await s.scalar(select(SignalRow))
+    assert sig is not None and sig.reject_reason == "exchange_position_exists"
+
+
+async def test_uncertain_entry_is_adopted_when_position_appears(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.brokers.base import BrokerError, OrderRequest, OrderType
+
+    original = env.paper.place_order
+
+    async def lost_response(req: OrderRequest) -> Any:
+        res = await original(req)
+        if req.order_type is OrderType.MARKET and not req.reduce_only:
+            raise BrokerError("network: read timeout")  # ордер исполнен, ответ потерян
+        return res
+
+    async def lookup_down(symbol: str, link_id: str) -> Any:
+        raise BrokerError("network: connect timeout")
+
+    monkeypatch.setattr(env.paper, "place_order", lost_response)
+    monkeypatch.setattr(env.paper, "get_order", lookup_down)
+    await working_close(env)
+    (t,) = await trades(env)
+    assert t.status == "pending"
+    assert not env.engine.tracked[SYMBOL].confirmed
+    # пока исход неизвестен — новых входов нет
+    env.clock.now += H
+    await working_close(env)
+    assert len(await trades(env)) == 1
+    await env.engine.reconcile()
+    (t,) = await trades(env)
+    assert t.status == "open"
+    assert env.engine.tracked[SYMBOL].confirmed
+    assert SYMBOL in env.engine.risk.state.open
+
+
+async def test_uncertain_entry_cancelled_if_never_filled(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.brokers.base import BrokerError, OrderRequest
+    from app.core.engine import CONFIRM_ATTEMPTS
+
+    async def never(req: OrderRequest) -> Any:
+        raise BrokerError("network: read timeout")
+
+    async def not_found(symbol: str, link_id: str) -> Any:
+        return None
+
+    monkeypatch.setattr(env.paper, "place_order", never)
+    monkeypatch.setattr(env.paper, "get_order", not_found)
+    await working_close(env)
+    for _ in range(CONFIRM_ATTEMPTS):
+        await env.engine.reconcile()
+    (t,) = await trades(env)
+    assert t.status == "cancelled" and t.close_reason == "not_filled"
+    assert SYMBOL not in env.engine.tracked
+
+
+async def test_failed_close_is_retried(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.brokers.base import BrokerError
+
+    await working_close(env)
+    stub = env.engine.signal_engine
+    assert isinstance(stub, StubSignals)
+    stub.next = None
+    executor = env.engine.executors["crypto"]
+    original = executor.close_position
+    calls = {"n": 0}
+
+    async def flaky(trade_id: int, symbol: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise BrokerError("service unavailable")
+        await original(trade_id, symbol)
+
+    monkeypatch.setattr(executor, "close_position", flaky)
+    for _ in range(CONFIG.strategy.stops.time_stop_bars):
+        env.clock.now += H
+        await working_close(env)
+    assert calls["n"] == 1
+    assert env.engine.tracked[SYMBOL].pending_reason is None  # не «застряла»
+    env.clock.now += H
+    await working_close(env)  # тайм-стоп срабатывает повторно
+    await env.engine.reconcile()
+    (t,) = await trades(env)
+    assert t.status == "closed" and t.close_reason == "time"
+
+
+async def test_backfilled_candles_trigger_paper_stops(env: Env) -> None:
+    await working_close(env)
+    (t,) = await trades(env)
+    stop = float(t.stop_loss)
+    ts = env.clock.now
+    missed = [
+        Candle(ts, stop + 2, stop + 3, stop + 1, stop + 2, 1),
+        Candle(ts + M15, stop + 2, stop + 3, stop - 1, stop + 2, 1),  # стоп внутри пропуска
+        Candle(ts + 2 * M15, stop + 2, stop + 4, stop + 1, stop + 3, 1),
+    ]
+    env.clock.now += 3 * M15
+    await env.engine.on_backfill(SYMBOL, Timeframe.M15, missed)
+    await env.engine.reconcile()
+    (t,) = await trades(env)
+    assert t.status == "closed" and t.close_reason == "sl"
+
+
+async def test_restart_with_pending_trade_adopts_filled_position(
+    env: Env, db_sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    await working_close(env)
+    (t,) = await trades(env)
+    # имитируем падение процесса между исполнением входа и записью статуса open
+    await env.repo.update_trade(t.id, status="pending", entry_price=None)
+    restarted = await make_engine(env, db_sessionmaker)
+    (t,) = await trades(env)
+    assert t.status == "open"
+    assert restarted.engine.tracked[SYMBOL].confirmed

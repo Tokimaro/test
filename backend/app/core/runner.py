@@ -98,13 +98,17 @@ class BotRuntime:
             ensure_fresh=self._ensure_fresh,
         )
         self.engine = engine
+        # Сначала восстановить состояние (открытые сделки, риск, kill switch), и только потом
+        # пускать свечи: иначе свежая свеча могла бы открыть сделку «вслепую»
+        await engine.start()
         for name, broker in self.brokers.items():
             market = self.config.markets[name]
             tfs = market.timeframes
             subs = [(s, tf) for s in market.symbols for tf in (tfs.entry, tfs.working, tfs.higher)]
-            self.feeds[name] = CandleFeed(broker, self.store, subs, engine.on_candle)
+            self.feeds[name] = CandleFeed(
+                broker, self.store, subs, engine.on_candle, on_synced=engine.on_backfill
+            )
             await self.feeds[name].sync_all()
-        await engine.start()
         for name, feed in self.feeds.items():
             self._tasks.append(asyncio.create_task(self._supervise(f"feed:{name}", feed.run)))
         self._tasks.append(asyncio.create_task(self._supervise("reconcile", self._reconcile_loop)))

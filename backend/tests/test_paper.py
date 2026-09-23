@@ -15,7 +15,10 @@ def candle(o: float, h: float, lo: float, c: float, ts: int = 0) -> Candle:
 
 
 async def broker() -> PaperBroker:
-    b = PaperBroker(FakeMarketBroker(), initial_equity=D(10_000), slippage_pct=D(0))
+    # часы на нуле: все тестовые свечи (ts >= 1) заканчиваются после входа
+    b = PaperBroker(
+        FakeMarketBroker(), initial_equity=D(10_000), slippage_pct=D(0), clock=lambda: 0
+    )
     await b.on_candle("BTCUSDT", candle(100, 100, 100, 100))
     return b
 
@@ -131,10 +134,42 @@ async def test_state_roundtrip() -> None:
             reduce_only=True,
         )
     )
+    await b.close_position("BTCUSDT", D(2))
     restored = PaperBroker(FakeMarketBroker())
     restored.load_dict(b.to_dict())
     assert restored.cash == b.cash
     assert restored.positions == b.positions
     assert restored.limits == b.limits
+    assert restored.closed == b.closed
+    assert restored.last_price == b.last_price
+    # после рестарта рыночный ордер исполняется по сохранённой цене
+    await restored.close_position("BTCUSDT")
     with pytest.raises(BrokerError):
         await restored.place_order(order("e1"))
+
+
+async def test_candle_replay_is_idempotent() -> None:
+    b = await broker()
+    await b.place_order(order("e1", stop_loss=D(97)))
+    await b.on_candle("BTCUSDT", candle(100, 101, 99, 100, ts=5))
+    await b.on_candle("BTCUSDT", candle(100, 101, 90, 100, ts=5))  # та же свеча повторно
+    assert "BTCUSDT" in b.positions
+
+
+async def test_candle_before_entry_does_not_trigger_stop() -> None:
+    now = [1_000]
+    b = PaperBroker(FakeMarketBroker(), slippage_pct=D(0), clock=lambda: now[0])
+    b.mark_price("BTCUSDT", 100, 900)
+    await b.place_order(order("e1", stop_loss=D(97)))  # вход в t=1000
+    # свеча [100; 1000) закончилась в момент входа: её минимум был до входа
+    await b.on_candle("BTCUSDT", candle(100, 101, 95, 100, ts=100), tf_ms=900)
+    assert "BTCUSDT" in b.positions
+    await b.on_candle("BTCUSDT", candle(100, 101, 95, 96, ts=1_000), tf_ms=900)
+    assert "BTCUSDT" not in b.positions
+
+
+def test_mark_price_ignores_older_updates() -> None:
+    b = PaperBroker(FakeMarketBroker())
+    b.mark_price("X", 10, 200)
+    b.mark_price("X", 9, 100)
+    assert b.last_price["X"] == D(10)

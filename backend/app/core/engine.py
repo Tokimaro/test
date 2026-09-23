@@ -20,11 +20,12 @@ from app.analysis.features import build_features
 from app.analysis.indicators import candles_to_frame
 from app.analysis.regime import Regime
 from app.brokers.base import BrokerAdapter, BrokerError, CandleClosed
+from app.brokers.paper import PaperBroker
 from app.core.events import EventBus
 from app.db.candles import ms_to_dt
 from app.db.models import TradeRow
 from app.db.repo import TradeRepo
-from app.domain import Direction, Timeframe
+from app.domain import Candle, Direction, Position, Timeframe
 from app.execution.executor import OrderExecutor, OrderUncertain
 from app.execution.position_logic import (
     ClosePosition,
@@ -49,6 +50,7 @@ log = structlog.get_logger()
 
 HISTORY = {"working": 2500, "higher": 600, "entry": 400}
 FINALIZE_ATTEMPTS = 5  # сколько сверок ждать данных о закрытии от биржи
+CONFIRM_ATTEMPTS = 10  # сколько сверок ждать позицию после входа с неизвестным исходом
 
 
 def wall_ms() -> int:
@@ -63,6 +65,10 @@ class Tracked:
     tp1_link_id: str | None = None
     finalize_attempts: int = 0
     pending_reason: CloseReason | None = None
+    # False — ордер входа отправлен, но исход неизвестен (сеть/рестарт): позиция либо
+    # появится на бирже и будет «подхвачена» сверкой, либо сделка будет отменена
+    confirmed: bool = True
+    confirm_attempts: int = 0
 
 
 class TradingEngine:
@@ -107,10 +113,6 @@ class TradingEngine:
         if state:
             self.risk.state = RiskManager.state_from_dict(state)
         for row in await self.repo.open_trades():
-            if row.status != "open" or row.entry_price is None:
-                # вход не подтвердился до рестарта — решит сверка
-                await self.repo.update_trade(row.id, status="cancelled", close_reason="startup")
-                continue
             symbol = await self._symbol_of(row)
             if symbol is None or symbol not in self.symbol_market:
                 log.warning("engine.orphan_trade", trade_id=row.id)
@@ -120,6 +122,8 @@ class TradingEngine:
                 market=self.symbol_market[symbol],
                 pos=_position_from_row(row, symbol),
                 tp1_link_id=(row.extra or {}).get("tp1_link_id"),
+                # вход не подтвердился до рестарта — сверка подхватит позицию или отменит
+                confirmed=row.status == "open" and row.entry_price is not None,
             )
         await self.reconcile()
         self.bus.publish("bot_status", **self.status())
@@ -129,7 +133,7 @@ class TradingEngine:
             "paused": self.paused,
             "halted": self.risk.state.halted,
             "halt_reason": self.risk.state.halt_reason,
-            "open_positions": len(self.tracked),
+            "open_positions": sum(1 for t in self.tracked.values() if t.confirmed),
             "risk_pct": self.risk.current_risk_pct(),
             "drawdown_pct": round(self.risk.drawdown_pct(), 2),
         }
@@ -155,13 +159,29 @@ class TradingEngine:
         broker = self.brokers[market_name]
         # paper-брокеру отдаём только самый мелкий ТФ: крупные свечи повторно «проигрывали» бы
         # экстремумы, уже обработанные мелкими
-        on_candle = getattr(broker, "on_candle", None)
-        if on_candle is not None and event.timeframe is market.timeframes.entry:
-            await on_candle(event.symbol, event.candle)
+        if isinstance(broker, PaperBroker):
+            if event.timeframe is market.timeframes.entry:
+                await broker.on_candle(event.symbol, event.candle, event.timeframe.ms)
+            elif event.timeframe is market.timeframes.working:
+                # вход по закрытию рабочей свечи — по её цене, даже если 15m ещё не пришла
+                broker.mark_price(
+                    event.symbol, event.candle.close, event.candle.ts + event.timeframe.ms
+                )
         if event.timeframe is not market.timeframes.working:
             return
         async with self._lock:
             await self._on_working_candle(event.symbol, market_name, market)
+
+    async def on_backfill(self, symbol: str, tf: Timeframe, candles: list[Candle]) -> None:
+        """Свечи, докачанные после обрыва потока: paper-брокер проверяет по ним стопы/цели,
+        иначе пропущенные экстремумы не сработали бы (в отличие от настоящей биржи)."""
+        market_name = self.symbol_market.get(symbol)
+        if market_name is None:
+            return
+        broker = self.brokers[market_name]
+        if isinstance(broker, PaperBroker) and tf is self.markets[market_name].timeframes.entry:
+            for c in candles:
+                await broker.on_candle(symbol, c, tf.ms)
 
     async def _on_working_candle(
         self, symbol: str, market_name: str, market: MarketSettings
@@ -260,6 +280,10 @@ class TradingEngine:
             return False, plan.reason
 
         inst = await broker.get_instrument(symbol)
+        # позиция на бирже, о которой движок не знает (ручная, из прошлого запуска) —
+        # новый вход добавился бы к ней и переписал её стоп
+        if any(p.symbol == symbol for p in await broker.get_positions()):
+            return False, "exchange_position_exists"
         balance = await broker.get_balance()
         stop = inst.round_price(plan.stop)
         tp2 = inst.round_price(plan.tp2)
@@ -280,9 +304,32 @@ class TradingEngine:
         if not sizing.ok:
             return False, f"size_{sizing.reject}"
 
-        iid = self.instrument_ids[symbol]
+        pos = ManagedPosition(
+            symbol=symbol,
+            direction=plan.direction,
+            strategy=plan.strategy,
+            entry=plan.entry,
+            qty=float(sizing.qty),
+            initial_stop=float(stop),
+            stop=float(stop),
+            tp1=float(tp1) if tp1 is not None else None,
+            tp2=float(tp2),
+            tp1_fraction=plan.tp1_fraction,
+            trailing=plan.trailing,
+            opened_ts=now,
+            risk_amount=float(sizing.risk_amount),
+            confidence=signal.confidence,
+            regime=signal.regime.value,
+        )
+        extra = {
+            "regime": signal.regime.value,
+            "plan_entry": plan.entry,
+            "leverage": str(sizing.leverage),
+            "tp1_fraction": pos.tp1_fraction,
+            "trailing": pos.trailing,
+        }
         trade_id = await self.repo.create_trade(
-            instrument_id=iid,
+            instrument_id=self.instrument_ids[symbol],
             strategy=plan.strategy,
             direction=plan.direction.value,
             status="pending",
@@ -294,11 +341,8 @@ class TradingEngine:
             tp2=tp2,
             risk_amount=sizing.risk_amount,
             confidence=signal.confidence,
-            extra={
-                "regime": signal.regime.value,
-                "plan_entry": plan.entry,
-                "leverage": str(sizing.leverage),
-            },
+            opened_at=ms_to_dt(now),
+            extra=extra,
         )
         try:
             fill = await self.executors[market_name].open_position(
@@ -314,69 +358,66 @@ class TradingEngine:
                 derivatives=derivatives,
             )
         except OrderUncertain as exc:
+            # ордер мог исполниться: держим сделку неподтверждённой, сверка решит её судьбу,
+            # а до тех пор новые входы по символу заблокированы
             log.error("engine.entry_uncertain", symbol=symbol, error=str(exc))
             self.bus.publish(
                 "alert", level="error", kind="entry_uncertain", symbol=symbol, error=str(exc)
             )
-            await self.repo.update_trade(trade_id, status="cancelled", close_reason="uncertain")
+            self.tracked[symbol] = Tracked(trade_id, market_name, pos, confirmed=False)
             return False, "order_uncertain"
         except BrokerError as exc:
             log.error("engine.entry_rejected", symbol=symbol, error=str(exc))
             await self.repo.update_trade(trade_id, status="cancelled", close_reason="rejected")
             return False, f"broker_rejected:{exc.code}"
 
-        pos = ManagedPosition(
-            symbol=symbol,
-            direction=plan.direction,
-            strategy=plan.strategy,
-            entry=float(fill.entry_price),
-            qty=float(fill.qty),
-            initial_stop=float(stop),
-            stop=float(stop),
-            tp1=float(tp1) if tp1 is not None and fill.tp1_link_id else None,
-            tp2=float(tp2),
-            tp1_fraction=plan.tp1_fraction if fill.tp1_link_id else 0.0,
-            trailing=plan.trailing,
-            opened_ts=now,
-            risk_amount=float(sizing.risk_amount),
-            confidence=signal.confidence,
-            regime=signal.regime.value,
-        )
+        if fill.tp1_link_id is None:
+            # без TP1 остаток сразу ведётся трейлингом
+            pos.tp1, pos.tp1_fraction = None, 0.0
+        if fill.tp1_error:
+            self.bus.publish(
+                "alert", level="error", kind="tp1_failed", symbol=symbol, error=fill.tp1_error
+            )
         self.tracked[symbol] = Tracked(trade_id, market_name, pos, fill.tp1_link_id)
+        await self._confirm(symbol, fill.entry_price, fill.qty, fill.tp1_link_id)
+        return True, None
+
+    async def _confirm(
+        self, symbol: str, entry: Decimal, qty: Decimal, tp1_link_id: str | None
+    ) -> None:
+        """Позиция подтверждена биржей: фиксируем фактический вход и учитываем риск."""
+        tr = self.tracked[symbol]
+        pos = tr.pos
+        pos.entry, pos.qty, pos.remaining = float(entry), float(qty), float(qty)
+        tr.confirmed = True
+        trade = await self.repo.get_trade(tr.trade_id)
+        extra = dict(trade.extra or {}) if trade is not None else {}
+        extra.update(tp1_link_id=tp1_link_id, tp1_fraction=pos.tp1_fraction, trailing=pos.trailing)
         await self.repo.update_trade(
-            trade_id,
+            tr.trade_id,
             status="open",
-            entry_price=fill.entry_price,
-            qty=fill.qty,
-            remaining_qty=fill.qty,
+            entry_price=entry,
+            qty=qty,
+            remaining_qty=qty,
             tp1=Decimal(str(pos.tp1)) if pos.tp1 is not None else None,
-            opened_at=ms_to_dt(now),
-            extra={
-                "regime": signal.regime.value,
-                "plan_entry": plan.entry,
-                "leverage": str(sizing.leverage),
-                "tp1_link_id": fill.tp1_link_id,
-                "tp1_fraction": pos.tp1_fraction,
-                "trailing": pos.trailing,
-            },
+            extra=extra,
         )
-        self.risk.on_position_opened(symbol, plan.direction, pos.open_risk())
+        self.risk.on_position_opened(symbol, pos.direction, pos.open_risk())
         await self._save_risk_state()
         self.bus.publish(
             "trade_opened",
-            trade_id=trade_id,
+            trade_id=tr.trade_id,
             symbol=symbol,
-            direction=plan.direction.value,
-            entry=float(fill.entry_price),
-            qty=float(fill.qty),
-            stop=float(stop),
+            direction=pos.direction.value,
+            entry=pos.entry,
+            qty=pos.qty,
+            stop=pos.stop,
             tp1=pos.tp1,
-            tp2=float(tp2),
-            confidence=signal.confidence,
-            strategy=plan.strategy,
+            tp2=pos.tp2,
+            confidence=pos.confidence,
+            strategy=pos.strategy,
         )
-        log.info("engine.trade_opened", symbol=symbol, trade_id=trade_id)
-        return True, None
+        log.info("engine.trade_opened", symbol=symbol, trade_id=tr.trade_id)
 
     async def _correlations(self, symbol: str, market: MarketSettings) -> dict[str, float]:
         tf = market.timeframes.working
@@ -389,8 +430,8 @@ class TradingEngine:
     # ------------------------------------------------------------------ ведение позиции
     async def _manage(self, symbol: str, row: Row) -> None:
         tr = self.tracked[symbol]
-        if tr.pending_reason is not None or tr.finalize_attempts > 0:
-            return  # позиция уже закрывается — ждём финализации в reconcile
+        if not tr.confirmed or tr.finalize_attempts > 0:
+            return  # вход не подтверждён или позиция уже закрыта — решит сверка
         pos = tr.pos
         actions = on_bar_close(
             pos, row["close"], row["chand_long"], row["chand_short"], self.config.strategy.stops
@@ -402,6 +443,8 @@ class TradingEngine:
                 await self.close_trade(symbol, action.reason)
             elif isinstance(action, MoveStop):
                 await self._move_stop(symbol, action, broker)
+        if symbol in self.tracked and self.tracked[symbol].pending_reason is not None:
+            await self._reconcile_market(tr.market)
 
     async def _move_stop(self, symbol: str, move: MoveStop, broker: BrokerAdapter) -> None:
         tr = self.tracked[symbol]
@@ -423,21 +466,25 @@ class TradingEngine:
             kind=move.kind.value,
         )
 
-    async def close_trade(self, symbol: str, reason: CloseReason) -> None:
-        """Закрытие по решению бота (тайм-стоп, вручную, kill switch). Финализация — в reconcile."""
+    async def close_trade(self, symbol: str, reason: CloseReason) -> bool:
+        """Закрытие по решению бота (тайм-стоп, вручную, kill switch).
+
+        Итог (PnL) фиксирует сверка. При ошибке причина сбрасывается, чтобы позиция
+        продолжала вестись и закрытие повторилось (тайм-стоп — на следующей свече)."""
         tr = self.tracked.get(symbol)
-        if tr is None:
-            return
+        if tr is None or not tr.confirmed:
+            return False
         tr.pending_reason = reason
         try:
             await self.executors[tr.market].close_position(tr.trade_id, symbol)
         except BrokerError as exc:
+            tr.pending_reason = None
             log.error("engine.close_failed", symbol=symbol, error=str(exc))
             self.bus.publish(
                 "alert", level="error", kind="close_failed", symbol=symbol, error=str(exc)
             )
-            return
-        await self._reconcile_market(tr.market)
+            return False
+        return True
 
     # ------------------------------------------------------------------ сверка
     async def reconcile(self) -> None:
@@ -457,16 +504,21 @@ class TradingEngine:
         except BrokerError as exc:
             log.error("engine.reconcile_failed", market=market_name, error=str(exc))
             return
-        for symbol, tr in list(self.tracked.items()):
-            if tr.market != market_name:
+        for symbol in list(self.tracked):
+            tr = self.tracked.get(symbol)
+            if tr is None or tr.market != market_name:
                 continue
             ex = positions.get(symbol)
+            if not tr.confirmed:
+                await self._confirm_or_cancel(symbol, ex)
+                continue
             if ex is None or ex.direction is not tr.pos.direction:
                 await self._finalize(symbol, broker)
                 continue
             pos = tr.pos
             ex_qty = float(ex.qty)
-            if not pos.tp1_done and pos.tp1 is not None and ex_qty < pos.remaining * 0.999:
+            if not pos.tp1_done and ex_qty < pos.remaining * 0.999:
+                # частичное исполнение (TP1) — стоп в безубыток
                 await self._on_tp1(symbol, ex_qty, broker)
             if ex.stop_loss is None:
                 # позиция без стопа недопустима — восстанавливаем немедленно
@@ -477,11 +529,25 @@ class TradingEngine:
                     await broker.amend_stops(symbol, stop_loss=inst.round_price(pos.stop))
                 except BrokerError as exc:
                     log.error("engine.restore_stop_failed", symbol=symbol, error=str(exc))
+                    # закрываем; финализация — на следующей сверке (без вложенного вызова)
                     await self.close_trade(symbol, CloseReason.KILL)
         for symbol in positions:
             if symbol not in self.tracked and symbol not in self._unmanaged_alerted:
                 self._unmanaged_alerted.add(symbol)
                 self.bus.publish("alert", level="warning", kind="unmanaged_position", symbol=symbol)
+
+    async def _confirm_or_cancel(self, symbol: str, ex: Position | None) -> None:
+        tr = self.tracked[symbol]
+        if ex is not None and ex.direction is tr.pos.direction:
+            log.warning("engine.uncertain_entry_confirmed", symbol=symbol, trade_id=tr.trade_id)
+            await self._confirm(symbol, ex.entry_price, ex.qty, tr.tp1_link_id)
+            self._unmanaged_alerted.discard(symbol)
+            return
+        tr.confirm_attempts += 1
+        if tr.confirm_attempts >= CONFIRM_ATTEMPTS:
+            del self.tracked[symbol]
+            await self.repo.update_trade(tr.trade_id, status="cancelled", close_reason="not_filled")
+            log.warning("engine.uncertain_entry_cancelled", symbol=symbol, trade_id=tr.trade_id)
 
     async def _on_tp1(self, symbol: str, ex_qty: float, broker: BrokerAdapter) -> None:
         tr = self.tracked[symbol]
@@ -545,16 +611,29 @@ class TradingEngine:
 
     async def _snapshot_equity(self) -> None:
         equity = available = unreal = Decimal(0)
-        for broker in {id(b): b for b in self.brokers.values()}.values():
+        accounts = {b.account_key(): b for b in self.brokers.values()}
+        for key, broker in accounts.items():
             try:
                 bal = await broker.get_balance()
-                positions = await broker.get_positions()
             except BrokerError as exc:
-                log.warning("engine.balance_unavailable", error=str(exc))
+                log.warning("engine.balance_unavailable", account=key, error=str(exc))
                 return
             equity += bal.equity
             available += bal.available
-            unreal += sum((p.unrealized_pnl for p in positions), Decimal(0))
+        for market_name, broker in self.brokers.items():
+            try:
+                positions = await broker.get_positions()
+            except BrokerError as exc:
+                log.warning("engine.positions_unavailable", market=market_name, error=str(exc))
+                return
+            symbols = (
+                set(self.markets[market_name].symbols) if market_name in self.markets else set()
+            )
+            # позиции одного счёта видны через адаптеры разных категорий: берём только свои
+            unreal += sum(
+                (p.unrealized_pnl for p in positions if not symbols or p.symbol in symbols),
+                Decimal(0),
+            )
         now = self.clock()
         self.risk.on_equity(now, float(equity))
         open_risk = Decimal(str(sum(t.pos.open_risk() for t in self.tracked.values())))
@@ -605,7 +684,9 @@ class TradingEngine:
 
     async def close_manually(self, symbol: str) -> None:
         async with self._lock:
-            await self.close_trade(symbol, CloseReason.MANUAL)
+            tr = self.tracked.get(symbol)
+            if tr is not None and await self.close_trade(symbol, CloseReason.MANUAL):
+                await self._reconcile_market(tr.market)
 
     async def move_to_breakeven(self, symbol: str) -> None:
         async with self._lock:
@@ -638,7 +719,7 @@ def _position_from_row(row: TradeRow, symbol: str) -> ManagedPosition:
         symbol=symbol,
         direction=Direction(row.direction),
         strategy=row.strategy,
-        entry=float(row.entry_price or 0),
+        entry=float(row.entry_price or extra.get("plan_entry") or 0),
         qty=float(row.qty),
         initial_stop=initial,
         stop=stop,

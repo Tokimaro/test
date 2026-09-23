@@ -100,6 +100,11 @@ class BrokerAdapter(ABC):
     @abstractmethod
     async def server_time_ms(self) -> int: ...
 
+    def account_key(self) -> str:
+        """Идентификатор счёта: адаптеры одного счёта (разные категории одного UTA)
+        дают одинаковый ключ, чтобы капитал не суммировался дважды."""
+        return f"{self.name}:{id(self)}"
+
     async def get_funding_rate(self, symbol: str) -> float | None:
         """Текущая ставка финансирования (для перпетуалов); None — неприменимо."""
         return None
