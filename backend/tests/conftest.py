@@ -15,7 +15,7 @@ TEST_DB_URL = os.environ.get("TB_TEST_DATABASE_URL")
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings(_env_file=None, mode=RunMode.PAPER, log_json=False)
+    return Settings(_env_file=None, mode=RunMode.PAPER, log_json=False, run_bot=False)
 
 
 # ---------------------------------------------------------------- БД (опционально)
@@ -40,7 +40,7 @@ def migrated_db() -> Iterator[str]:
 
 ALL_TABLES = (
     "candles, executions, orders, trades, signals, instruments, equity_snapshots, "
-    "settings, risk_events, backtest_runs, users, secrets"
+    "settings, risk_events, backtest_runs, users, secrets, runtime_state"
 )
 
 

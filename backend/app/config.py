@@ -3,6 +3,7 @@
 Торговые параметры (риск, стратегия, инструменты) живут отдельно — см. app.trading_config.
 """
 
+from decimal import Decimal
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -32,7 +33,6 @@ class Settings(BaseSettings):
     log_json: bool = True
 
     database_url: str = "postgresql+asyncpg://tradebot:tradebot@localhost:5432/tradebot"
-    redis_url: str = "redis://localhost:6379/0"
 
     bybit_testnet: bool = True
     bybit_api_key: SecretStr = SecretStr("")
@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     bybit_recv_window_ms: int = 5000
 
     trading_config_path: Path = BACKEND_DIR / "config" / "default.yaml"
+    # Запускать торговый движок вместе с API (в тестах и для чистого API — false)
+    run_bot: bool = True
+    paper_initial_equity: Decimal = Decimal(10_000)
 
     # Панель
     jwt_secret: SecretStr = SecretStr("")

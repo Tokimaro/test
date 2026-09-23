@@ -260,3 +260,63 @@ async def test_close_position_partial_reduce_only() -> None:
     assert body["qty"] == "0.4"
     assert await a.close_position("ETHUSDT") is None
     await a.aclose()
+
+
+@respx.mock
+async def test_get_order_falls_back_to_history() -> None:
+    respx.get(f"{BASE}/v5/order/realtime").mock(return_value=ok({"list": []}))
+    respx.get(f"{BASE}/v5/order/history").mock(
+        return_value=ok(
+            {
+                "list": [
+                    {
+                        "orderId": "o1",
+                        "orderLinkId": "L1",
+                        "orderStatus": "Filled",
+                        "avgPrice": "100.5",
+                        "cumExecQty": "2",
+                    }
+                ]
+            }
+        )
+    )
+    a = adapter()
+    o = await a.get_order("BTCUSDT", "L1")
+    assert o is not None
+    assert o.status == "Filled"
+    assert o.avg_price == Decimal("100.5")
+    assert o.filled_qty == Decimal(2)
+    await a.aclose()
+
+
+@respx.mock
+async def test_closed_pnl_sorted() -> None:
+    respx.get(f"{BASE}/v5/position/closed-pnl").mock(
+        return_value=ok(
+            {
+                "list": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "closedSize": "1",
+                        "avgEntryPrice": "100",
+                        "avgExitPrice": "110",
+                        "closedPnl": "9.8",
+                        "updatedTime": "2000",
+                    },
+                    {
+                        "symbol": "BTCUSDT",
+                        "closedSize": "1",
+                        "avgEntryPrice": "100",
+                        "avgExitPrice": "105",
+                        "closedPnl": "4.9",
+                        "updatedTime": "1000",
+                    },
+                ]
+            }
+        )
+    )
+    a = adapter()
+    items = await a.get_closed_pnl("BTCUSDT", 0)
+    assert [i.ts for i in items] == [1000, 2000]
+    assert items[1].pnl == Decimal("9.8")
+    await a.aclose()

@@ -3,7 +3,13 @@
 from collections.abc import AsyncGenerator
 from decimal import Decimal
 
-from app.brokers.base import BrokerAdapter, OrderRequest, OrderResult, StreamEvent
+from app.brokers.base import (
+    BrokerAdapter,
+    ClosedPnl,
+    OrderRequest,
+    OrderResult,
+    StreamEvent,
+)
 from app.domain import Balance, Candle, Instrument, MarketType, Position, Timeframe
 
 
@@ -61,6 +67,12 @@ class FakeMarketBroker(BrokerAdapter):
         raise NotImplementedError
 
     async def place_order(self, req: OrderRequest) -> OrderResult:
+        raise NotImplementedError
+
+    async def get_order(self, symbol: str, link_id: str) -> OrderResult | None:
+        raise NotImplementedError
+
+    async def get_closed_pnl(self, symbol: str, since_ms: int) -> list[ClosedPnl]:
         raise NotImplementedError
 
     async def amend_stops(

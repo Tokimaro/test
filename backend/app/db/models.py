@@ -225,3 +225,13 @@ class SecretRow(Base):
     name: Mapped[str] = mapped_column(String(64), primary_key=True)
     ciphertext: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = _ts()
+
+
+class RuntimeStateRow(Base):
+    """Служебное состояние, которое должно переживать рестарт (риск-менеджер, paper-счёт)."""
+
+    __tablename__ = "runtime_state"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[dict[str, Any]] = mapped_column(Json)
+    updated_at: Mapped[datetime] = _ts()

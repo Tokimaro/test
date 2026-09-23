@@ -11,6 +11,7 @@ from app.brokers.base import (
     BrokerAdapter,
     BrokerError,
     CandleClosed,
+    ClosedPnl,
     OrderRequest,
     OrderResult,
     OrderType,
@@ -155,6 +156,16 @@ class BybitAdapter(BrokerAdapter):
         if not items:
             return default
         return _dec(items[0].get("takerFeeRate")), _dec(items[0].get("makerFeeRate"))
+
+    async def get_funding_rate(self, symbol: str) -> float | None:
+        if self._category not in DERIVATIVE_CATEGORIES:
+            return None
+        result = await self._client.request(
+            "GET", "/v5/market/tickers", {"category": self._category, "symbol": symbol}
+        )
+        items = result.get("list") or []
+        rate = items[0].get("fundingRate") if items else None
+        return float(rate) if rate not in (None, "") else None
 
     async def get_candles(
         self, symbol: str, timeframe: Timeframe, start_ms: int, end_ms: int
@@ -305,16 +316,46 @@ class BybitAdapter(BrokerAdapter):
             raw=result,
         )
 
-    async def get_order(self, symbol: str, link_id: str) -> dict[str, Any] | None:
+    async def get_order(self, symbol: str, link_id: str) -> OrderResult | None:
         """Ищет ордер по клиентскому id среди активных, затем в истории."""
         params = {"category": self._category, "symbol": symbol, "orderLinkId": link_id}
         for path in ("/v5/order/realtime", "/v5/order/history"):
             result = await self._client.request("GET", path, params, auth=True)
             items = result.get("list") or []
             if items:
-                order: dict[str, Any] = items[0]
-                return order
+                o: dict[str, Any] = items[0]
+                avg = _dec(o.get("avgPrice"))
+                return OrderResult(
+                    order_id=str(o.get("orderId", "")),
+                    link_id=str(o.get("orderLinkId", link_id)),
+                    status=str(o.get("orderStatus", "")),
+                    avg_price=avg or None,
+                    filled_qty=_dec(o.get("cumExecQty")),
+                    raw=o,
+                )
         return None
+
+    async def get_closed_pnl(self, symbol: str, since_ms: int) -> list[ClosedPnl]:
+        self._require_derivatives()
+        result = await self._client.request(
+            "GET",
+            "/v5/position/closed-pnl",
+            {"category": self._category, "symbol": symbol, "startTime": since_ms, "limit": 100},
+            auth=True,
+        )
+        items = [
+            ClosedPnl(
+                symbol=str(r.get("symbol", symbol)),
+                qty=_dec(r.get("closedSize") or r.get("qty")),
+                avg_entry=_dec(r.get("avgEntryPrice")),
+                avg_exit=_dec(r.get("avgExitPrice")),
+                pnl=_dec(r.get("closedPnl")),
+                ts=int(r.get("updatedTime") or r.get("createdTime") or 0),
+                order_id=str(r.get("orderId", "")),
+            )
+            for r in result.get("list") or []
+        ]
+        return sorted(items, key=lambda c: c.ts)
 
     async def amend_stops(
         self,

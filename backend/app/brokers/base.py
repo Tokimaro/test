@@ -61,6 +61,19 @@ class OrderResult:
     raw: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ClosedPnl:
+    """Итог закрытия (части) позиции по данным биржи."""
+
+    symbol: str
+    qty: Decimal
+    avg_entry: Decimal
+    avg_exit: Decimal
+    pnl: Decimal  # реализованный PnL за вычетом комиссий
+    ts: int
+    order_id: str = ""
+
+
 class BrokerAdapter(ABC):
     name: str
 
@@ -87,6 +100,10 @@ class BrokerAdapter(ABC):
     @abstractmethod
     async def server_time_ms(self) -> int: ...
 
+    async def get_funding_rate(self, symbol: str) -> float | None:
+        """Текущая ставка финансирования (для перпетуалов); None — неприменимо."""
+        return None
+
     def is_market_open(self, symbol: str, ts_ms: int) -> bool:
         """Крипта торгуется круглосуточно; адаптеры акций переопределяют."""
         return True
@@ -103,6 +120,14 @@ class BrokerAdapter(ABC):
 
     @abstractmethod
     async def place_order(self, req: OrderRequest) -> OrderResult: ...
+
+    @abstractmethod
+    async def get_order(self, symbol: str, link_id: str) -> OrderResult | None:
+        """Ордер по клиентскому id (активный или исторический); None — не найден."""
+
+    @abstractmethod
+    async def get_closed_pnl(self, symbol: str, since_ms: int) -> list[ClosedPnl]:
+        """Закрытия позиции по symbol, начиная с since_ms, по возрастанию времени."""
 
     @abstractmethod
     async def amend_stops(
