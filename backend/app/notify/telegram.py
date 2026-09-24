@@ -25,21 +25,26 @@ ALERT_ICONS = {"error": "🚨", "warning": "⚠️"}
 
 def format_event(event: Event) -> str | None:
     d = event.data
-    if event.type == "trade_opened":
-        side = "🟢 LONG" if d.get("direction") == "long" else "🔴 SHORT"
-        tp1 = f" TP1 {d['tp1']:.6g}" if d.get("tp1") else ""
+    if event.type in ("trade_opened", "trade_updated"):
+        icon = "🟢" if d.get("side") == "buy" else "🔻"
+        verb = "Покупка" if d.get("side") == "buy" else "Продажа"
         return (
-            f"{side} {d.get('symbol')} @ {d.get('entry', 0):.6g}\n"
-            f"SL {d.get('stop', 0):.6g}{tp1} TP2 {d.get('tp2', 0):.6g}\n"
-            f"Уверенность {d.get('confidence', 0):.0f}% · {d.get('strategy')}"
+            f"{icon} {verb} {d.get('symbol')}: {d.get('qty', 0):.6g} @ {d.get('price', 0):.6g}\n"
+            f"Целевая доля {float(d.get('weight') or 0) * 100:.1f}%"
         )
     if event.type == "trade_closed":
         pnl = float(d.get("pnl") or 0)
         icon = "✅" if pnl > 0 else "❌"
         return (
-            f"{icon} Закрыта {d.get('symbol')}: {pnl:+.2f} USDT "
-            f"({float(d.get('r_multiple') or 0):+.2f}R) · {d.get('reason')}"
+            f"{icon} Продано всё {d.get('symbol')}: {pnl:+.2f} USDT "
+            f"({float(d.get('return_pct') or 0):+.2f}%) · {d.get('reason')}"
         )
+    if event.type == "rebalance" and not d.get("skipped"):
+        orders = d.get("orders") or []
+        if not orders:
+            return None
+        lines = [f"{o['side']} {o['symbol']} {o['qty']:.6g} @ {o['price']:.6g}" for o in orders]
+        return "🔄 Ребалансировка:\n" + "\n".join(lines)
     if event.type == "alert":
         icon = ALERT_ICONS.get(str(d.get("level")), "ℹ️")
         details = {k: v for k, v in d.items() if k not in ("level", "kind")}
@@ -158,18 +163,18 @@ class TelegramNotifier:
             return (
                 f"Режим: {self._ctx.settings.mode.value}\n"
                 f"Пауза: {st['paused']} · Остановлен: {st['halted']} ({st['halt_reason']})\n"
-                f"Позиций: {st['open_positions']} · Риск/сделка: {st['risk_pct']}%\n"
+                f"Монет в портфеле: {st['open_positions']} · "
+                f"Целевая волатильность: {st['target_vol_pct']}%\n"
                 f"Просадка: {st['drawdown_pct']}%"
             )
         if engine is None:
             return None if not cmd.startswith("/") else "Движок не запущен"
         if cmd == "/positions":
-            if not engine.tracked:
-                return "Открытых позиций нет"
+            if not engine.holdings:
+                return "Портфель в кэше: монет нет"
             return "\n".join(
-                f"{s}: {t.pos.direction.value} {t.pos.remaining:g} @ {t.pos.entry:.6g}, "
-                f"SL {t.pos.stop:.6g}"
-                for s, t in engine.tracked.items()
+                f"{s}: {h.qty:g} @ {h.avg_entry:.6g}, цель {engine.targets.get(s, 0.0) * 100:.1f}%"
+                for s, h in engine.holdings.items()
             )
         if cmd == "/pause":
             engine.pause()

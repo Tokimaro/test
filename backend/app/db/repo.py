@@ -18,7 +18,7 @@ from app.db.models import (
     TradeRow,
 )
 from app.risk.manager import RiskEvent
-from app.strategy.ensemble import Signal
+from app.strategy.trend import Signal
 
 
 def _jsonable(value: Any) -> Any:
@@ -50,10 +50,13 @@ class TradeRepo:
                 ts=ms_to_dt(signal.ts),
                 instrument_id=instrument_id,
                 mode=self.mode,
-                direction=signal.direction.value if signal.direction else None,
-                confidence=float(signal.confidence),
-                regime=signal.regime.value,
-                components=_jsonable({**signal.components, "strategy": signal.strategy}),
+                direction=signal.direction,
+                # для стратегии тренда: целевая доля монеты в портфеле, %
+                confidence=round(signal.weight * 100, 4),
+                regime="rebalance" if acted else "",
+                components=_jsonable(
+                    {**signal.components, "weight": signal.weight, "score": signal.score}
+                ),
                 acted=acted,
                 reject_reason=reject_reason,
             )

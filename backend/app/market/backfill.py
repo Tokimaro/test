@@ -1,8 +1,7 @@
 """Загрузка истории свечей в БД.
 
-Примеры:
-    uv run python -m app.market.backfill --symbols BTCUSDT ETHUSDT --tf 15 60 240 --days 730
-    uv run python -m app.market.backfill --broker alpaca --symbols AAPL MSFT --tf 15 60 D
+Пример (стратегии нужны дневные свечи спота, 120+ дней; для бэктеста — несколько лет):
+    uv run python -m app.market.backfill --symbols BTCUSDT ETHUSDT SOLUSDT --days 1500
 
 Для Bybit история берётся с mainnet (ключи не нужны), для Alpaca нужны TB_ALPACA_API_KEY/SECRET.
 """
@@ -67,10 +66,10 @@ async def backfill(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbols", nargs="+", required=True)
-    parser.add_argument("--tf", nargs="+", default=["15", "60", "240"])
-    parser.add_argument("--days", type=int, default=730)
+    parser.add_argument("--tf", nargs="+", default=["D"])
+    parser.add_argument("--days", type=int, default=1500)
     parser.add_argument("--broker", choices=["bybit", "alpaca"], default="bybit")
-    parser.add_argument("--category", default="linear")
+    parser.add_argument("--category", default="spot")
     args = parser.parse_args()
     configure_logging(json=False)
     asyncio.run(

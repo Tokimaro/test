@@ -66,6 +66,9 @@ def parse_ws_kline(topic: str, item: dict[str, Any]) -> CandleClosed | None:
     return CandleClosed(symbol=symbol, timeframe=Timeframe(interval), candle=candle)
 
 
+ORDER_NOT_FOUND = 110001  # «order not exists or too late to cancel»
+
+
 class BybitAdapter(BrokerAdapter):
     name = "bybit"
 
@@ -235,13 +238,18 @@ class BybitAdapter(BrokerAdapter):
         if not accounts:
             raise BrokerError("пустой ответ wallet-balance")
         acc = accounts[0]
-        return Balance(
-            equity=_dec(acc.get("totalEquity")),
-            available=_dec(acc.get("totalAvailableBalance")),
-            currency="USD",
-        )
+        available = _dec(acc.get("totalAvailableBalance"))
+        if self._category == "spot":
+            # на споте покупать можно только на свободные USDT, а не на весь залог счёта
+            coin: dict[str, Any] = next(
+                (c for c in acc.get("coin") or [] if c.get("coin") == self._settle_coin), {}
+            )
+            available = _dec(coin.get("walletBalance")) - _dec(coin.get("locked"))
+        return Balance(equity=_dec(acc.get("totalEquity")), available=available, currency="USD")
 
     async def get_positions(self) -> list[Position]:
+        if self._category == "spot":
+            return await self._spot_holdings()
         self._require_derivatives()
         result = await self._client.request(
             "GET",
@@ -271,6 +279,31 @@ class BybitAdapter(BrokerAdapter):
             )
         return positions
 
+    async def _spot_holdings(self) -> list[Position]:
+        """Спот: «позиции» — монеты на едином счёте (кроме расчётной USDT). Средней цены
+        покупки биржа для спота не отдаёт — её ведёт сам бот."""
+        result = await self._client.request(
+            "GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"}, auth=True
+        )
+        accounts = result.get("list") or []
+        if not accounts:
+            raise BrokerError("пустой ответ wallet-balance")
+        out = []
+        for c in accounts[0].get("coin") or []:
+            coin = str(c.get("coin", ""))
+            qty = _dec(c.get("walletBalance"))
+            if coin == self._settle_coin or qty <= 0:
+                continue
+            out.append(
+                Position(
+                    symbol=f"{coin}{self._settle_coin}",
+                    direction=Direction.LONG,
+                    qty=qty,
+                    entry_price=Decimal(0),
+                )
+            )
+        return out
+
     async def set_leverage(self, symbol: str, leverage: Decimal) -> None:
         self._require_derivatives()
         lev = str(leverage.normalize())
@@ -291,6 +324,8 @@ class BybitAdapter(BrokerAdapter):
                 raise
 
     async def place_order(self, req: OrderRequest) -> OrderResult:
+        if self._category == "spot":
+            return await self._place_spot(req)
         self._require_derivatives()
         if req.qty <= 0:
             raise BrokerError("qty должен быть > 0")
@@ -324,6 +359,34 @@ class BybitAdapter(BrokerAdapter):
             raw=result,
         )
 
+    async def _place_spot(self, req: OrderRequest) -> OrderResult:
+        if req.qty <= 0:
+            raise BrokerError("qty должен быть > 0")
+        if req.stop_loss is not None or req.take_profit is not None:
+            raise BrokerError("спот: стоп и тейк при входе адаптером не поддерживаются")
+        body: dict[str, Any] = {
+            "category": "spot",
+            "symbol": req.symbol,
+            "side": _side(req.direction),
+            "orderType": req.order_type.value,
+            "qty": str(req.qty),
+            "orderLinkId": req.link_id,
+        }
+        if req.order_type is OrderType.MARKET:
+            # без этого qty рыночной покупки на споте считается в USDT, а не в монете
+            body["marketUnit"] = "baseCoin"
+        else:
+            if req.price is None:
+                raise BrokerError("для лимитного ордера нужна цена")
+            body["price"] = str(req.price)
+            body["timeInForce"] = "GTC"
+        result = await self._client.request("POST", "/v5/order/create", body, auth=True)
+        return OrderResult(
+            order_id=str(result.get("orderId", "")),
+            link_id=str(result.get("orderLinkId", req.link_id)),
+            raw=result,
+        )
+
     async def get_order(self, symbol: str, link_id: str) -> OrderResult | None:
         """Ищет ордер по клиентскому id среди активных, затем в истории."""
         params = {"category": self._category, "symbol": symbol, "orderLinkId": link_id}
@@ -344,6 +407,8 @@ class BybitAdapter(BrokerAdapter):
         return None
 
     async def get_closed_pnl(self, symbol: str, since_ms: int) -> list[ClosedPnl]:
+        if self._category == "spot":
+            return []  # у спота нет позиций с PnL на бирже — результат считает бот
         self._require_derivatives()
         result = await self._client.request(
             "GET",
@@ -389,11 +454,17 @@ class BybitAdapter(BrokerAdapter):
         await self._client.request("POST", "/v5/position/trading-stop", body, auth=True)
 
     async def close_position(self, symbol: str, qty: Decimal | None = None) -> OrderResult | None:
-        self._require_derivatives()
+        if self._category != "spot":
+            self._require_derivatives()
         position = next((p for p in await self.get_positions() if p.symbol == symbol), None)
         if position is None:
             return None
         close_qty = position.qty if qty is None else min(qty, position.qty)
+        if self._category == "spot":
+            # остаток монеты может быть мельче шага объёма (комиссия списывается в монете)
+            close_qty = (await self.get_instrument(symbol)).round_qty(close_qty)
+            if close_qty <= 0:
+                return None
         return await self.place_order(
             OrderRequest(
                 symbol=symbol,
@@ -403,6 +474,16 @@ class BybitAdapter(BrokerAdapter):
                 reduce_only=True,
             )
         )
+
+    async def cancel_order(self, symbol: str, link_id: str) -> bool:
+        body = {"category": self._category, "symbol": symbol, "orderLinkId": link_id}
+        try:
+            await self._client.request("POST", "/v5/order/cancel", body, auth=True)
+        except BrokerError as exc:
+            if exc.code == ORDER_NOT_FOUND:  # уже исполнен или отменён
+                return False
+            raise
+        return True
 
     async def cancel_all(self, symbol: str | None = None) -> None:
         body: dict[str, Any] = {"category": self._category}

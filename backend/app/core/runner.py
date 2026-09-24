@@ -113,7 +113,7 @@ class BotRuntime:
             AlpacaClient(ALPACA_DATA_URL, key, secret),
             paper=paper,
             feed=s.alpaca_feed,
-            session_buffer_minutes=market.session_buffer_minutes,
+            session_buffer_minutes=15,
         )
         return adapter, adapter
 
@@ -172,8 +172,7 @@ class BotRuntime:
         await engine.start()
         for name, broker in self.brokers.items():
             market = self.config.markets[name]
-            tfs = market.timeframes
-            subs = [(s, tf) for s in market.symbols for tf in (tfs.entry, tfs.working, tfs.higher)]
+            subs = [(s, Timeframe.D1) for s in market.symbols]
             self.feeds[name] = CandleFeed(
                 broker, self.store, subs, engine.on_candle, on_synced=engine.on_backfill
             )

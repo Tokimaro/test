@@ -14,9 +14,9 @@ import Trades from "./pages/Trades";
 
 const NAV = [
   ["/", "Обзор"],
-  ["/positions", "Позиции"],
-  ["/trades", "Сделки"],
-  ["/signals", "Сигналы"],
+  ["/positions", "Портфель"],
+  ["/trades", "Владения"],
+  ["/signals", "Доли"],
   ["/stats", "Статистика"],
   ["/backtests", "Бэктест"],
   ["/settings", "Настройки"],

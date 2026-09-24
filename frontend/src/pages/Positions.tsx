@@ -1,83 +1,88 @@
+import { Fragment, useState } from "react";
 import { Link } from "react-router-dom";
-import { Badge, Button, Card, ConfirmButton, Direction, ErrorBox, Table } from "../components/ui";
+import { TrendBreakdown } from "../components/TrendBreakdown";
+import { Badge, Card, ConfirmButton, ErrorBox, Table } from "../components/ui";
 import { post } from "../lib/api";
-import { dateTime, num, pnlClass, price, signed } from "../lib/format";
-import type { OpenPosition } from "../lib/types";
+import { dateTime, num, pct, pnlClass, price, signed } from "../lib/format";
+import type { Holding } from "../lib/types";
 import { useApi } from "../lib/useApi";
 import { useEvents } from "../lib/useEvents";
 
-/** Шкала «стоп — вход — цели» с текущим положением цены. */
-function LevelScale({ p }: { p: OpenPosition }) {
-  const sign = p.direction === "long" ? 1 : -1;
-  const risk = Math.abs(p.entry - p.stop) || 1;
-  const current = p.unrealized_r !== null ? p.entry + sign * p.unrealized_r * risk : null;
-  const lo = Math.min(p.stop, p.tp2, current ?? p.entry);
-  const hi = Math.max(p.stop, p.tp2, current ?? p.entry);
-  const pos = (v: number) => `${((v - lo) / (hi - lo || 1)) * 100}%`;
-  const marks: [number, string, string][] = [
-    [p.stop, "SL", "var(--bad)"],
-    [p.entry, "Вход", "var(--text-2)"],
-    ...(p.tp1 !== null ? [[p.tp1, "TP1", "var(--good)"] as [number, string, string]] : []),
-    [p.tp2, "TP2", "var(--good)"],
-  ];
+/** Текущая доля монеты против целевой. */
+function WeightBar({ current, target }: { current: number | null; target: number }) {
+  const max = Math.max(0.25, current ?? 0, target);
   return (
-    <div className="relative h-8 w-48" aria-label="Уровни позиции">
-      <div className="absolute top-3 right-0 left-0 h-px bg-line" />
-      {marks.map(([v, label, color]) => (
-        <div key={label} className="absolute top-1 -translate-x-1/2 text-center text-[10px]" style={{ left: pos(v) }} title={`${label}: ${price(v)}`}>
-          <div className="mx-auto h-4 w-0.5" style={{ background: color }} />
-          <span className="text-muted">{label}</span>
-        </div>
-      ))}
-      {current !== null && (
-        <div className="absolute top-1.5 size-3 -translate-x-1/2 rounded-full border-2 border-surface bg-accent" style={{ left: pos(current) }} title={`Цена ≈ ${price(current)}`} />
-      )}
+    <div className="w-40" aria-label="Доля в портфеле">
+      <div className="relative h-2 rounded bg-surface-2">
+        <div className="absolute inset-y-0 left-0 rounded bg-accent" style={{ width: `${((current ?? 0) / max) * 100}%` }} />
+        <div className="absolute -inset-y-1 w-0.5 bg-ink" style={{ left: `${(target / max) * 100}%` }} title={`Цель ${pct(target)}`} />
+      </div>
+      <div className="mt-1 text-xs text-muted">сейчас {pct(current)} · цель {pct(target)}</div>
     </div>
   );
 }
 
 export default function Positions() {
-  const { data, error, refresh } = useApi<OpenPosition[]>("/positions", 10_000);
+  const { data, error, refresh } = useApi<Holding[]>("/positions", 15_000);
+  const [open, setOpen] = useState<string | null>(null);
   useEvents((e) => {
-    if (e.type.startsWith("trade_")) void refresh();
+    if (e.type.startsWith("trade_") || e.type === "rebalance" || e.type === "signal") void refresh();
   });
+  const next = data?.[0]?.next_rebalance_ts;
 
   return (
-    <Card title="Открытые позиции">
+    <Card
+      title="Портфель"
+      actions={
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted">следующая ребалансировка: {dateTime(next)}</span>
+          <ConfirmButton
+            label="Ребалансировать сейчас"
+            variant="default"
+            confirmText="Привести портфель к последним рассчитанным долям по рынку?"
+            onConfirm={async () => { await post("/control/rebalance"); await refresh(); }}
+          />
+        </div>
+      }
+    >
+      <p className="mb-3 text-xs text-muted">
+        Стратегия держит монеты в растущем тренде и продаёт их, когда тренд пропадает. Доли пересчитываются каждый
+        день по закрытию дневной свечи, сделки — раз в неделю. Стоп-лоссов нет: выход — по сигналу тренда.
+      </p>
       <ErrorBox error={error} />
-      {data && data.length === 0 && <p className="text-sm text-muted">Открытых позиций нет</p>}
+      {data && data.length === 0 && <p className="text-sm text-muted">Движок не запущен</p>}
       {data && data.length > 0 && (
         <Table>
           <thead>
-            <tr>
-              <th>Инструмент</th><th>Направление</th><th>Вход</th><th>Объём</th><th>Уровни</th>
-              <th>PnL</th><th>Уверенность</th><th>Открыта</th><th />
-            </tr>
+            <tr><th>Монета</th><th>Доля</th><th>Объём</th><th>Средняя цена</th><th>Цена</th><th>Стоимость</th><th>Результат</th><th>С</th><th /></tr>
           </thead>
           <tbody>
-            {data.map((p) => (
-              <tr key={p.trade_id}>
-                <td>
-                  <Link className="font-medium hover:text-accent" to={`/trades/${p.trade_id}`}>{p.symbol}</Link>
-                  <div className="text-xs text-muted">{p.strategy} · {p.regime}</div>
-                </td>
-                <td><Direction value={p.direction} />{!p.confirmed && <div className="mt-1"><Badge tone="warn">не подтверждена</Badge></div>}</td>
-                <td>{price(p.entry)}</td>
-                <td>{num(p.remaining, 4)}{p.tp1_done && <div className="text-xs text-good">TP1 ✓</div>}</td>
-                <td>
-                  <LevelScale p={p} />
-                  <div className="text-xs text-muted">SL {price(p.stop)} ({p.stop_kind})</div>
-                </td>
-                <td className={pnlClass(p.unrealized)}>
-                  {signed(p.unrealized)}<div className="text-xs">{signed(p.unrealized_r, 2, "R")}</div>
-                </td>
-                <td>{num(p.confidence, 0)}%</td>
-                <td className="text-xs">{dateTime(p.opened_ts)}<div className="text-muted">{p.bars_held} св.</div></td>
-                <td className="space-x-1 whitespace-nowrap">
-                  <Button onClick={async () => { await post(`/positions/${p.symbol}/breakeven`); await refresh(); }} disabled={!p.confirmed}>В БУ</Button>
-                  <ConfirmButton label="Закрыть" confirmText={`Закрыть ${p.symbol} по рынку?`} disabled={!p.confirmed} onConfirm={async () => { await post(`/positions/${p.symbol}/close`); await refresh(); }} />
-                </td>
-              </tr>
+            {data.map((h) => (
+              <Fragment key={h.symbol}>
+                <tr className="cursor-pointer hover:bg-surface-2" onClick={() => setOpen(open === h.symbol ? null : h.symbol)}>
+                  <td>
+                    {h.trade_id ? <Link className="font-medium hover:text-accent" to={`/trades/${h.trade_id}`} onClick={(e) => e.stopPropagation()}>{h.symbol}</Link> : <span className="font-medium">{h.symbol}</span>}
+                    <div className="mt-1">{h.target_weight > 0 ? <Badge tone="good">тренд вверх</Badge> : <Badge>кэш</Badge>}</div>
+                  </td>
+                  <td><WeightBar current={h.weight} target={h.target_weight} /></td>
+                  <td>{h.qty ? num(h.qty, 4) : "—"}</td>
+                  <td>{price(h.entry)}</td>
+                  <td>{price(h.price)}</td>
+                  <td>{h.value ? num(h.value) : "—"}</td>
+                  <td className={pnlClass(h.unrealized)}>
+                    {signed(h.unrealized)}<div className="text-xs">{signed(h.unrealized_pct, 2, "%")}</div>
+                  </td>
+                  <td className="text-xs">{dateTime(h.opened_ts)}</td>
+                  <td onClick={(e) => e.stopPropagation()}>
+                    {h.qty > 0 && (
+                      <ConfirmButton label="Продать" confirmText={`Продать весь ${h.symbol} по рынку? На следующей ребалансировке стратегия решит заново.`} onConfirm={async () => { await post(`/positions/${h.symbol}/close`); await refresh(); }} />
+                    )}
+                  </td>
+                </tr>
+                {open === h.symbol && (
+                  <tr><td colSpan={9} className="bg-surface-2"><div className="max-w-md p-2"><TrendBreakdown components={{ ...h.components, weight: h.target_weight, score: h.score }} /></div></td></tr>
+                )}
+              </Fragment>
             ))}
           </tbody>
         </Table>

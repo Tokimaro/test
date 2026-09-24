@@ -20,38 +20,27 @@ export const pnlClass = (v: number | null | undefined): string =>
   v === null || v === undefined || v === 0 ? "text-ink-2" : v > 0 ? "text-good" : "text-bad";
 
 export const REASONS: Record<string, string> = {
-  sl: "Стоп-лосс",
-  be: "Безубыток",
-  trailing: "Трейлинг",
-  tp1: "TP1",
-  tp2: "TP2",
-  time: "Тайм-стоп",
+  schedule: "Ребалансировка",
+  signal: "Сигнал тренда",
   manual: "Вручную",
   kill: "Kill switch",
+  drawdown_stop: "Стоп по просадке",
+  external: "Продано вне бота",
   end: "Конец данных",
 };
 
 export const REJECTS: Record<string, string> = {
-  below_threshold: "уверенность ниже порога",
-  position_open: "позиция уже открыта",
-  position_exists: "позиция уже открыта",
-  exchange_position_exists: "на бирже есть неучтённая позиция",
-  max_open_positions: "лимит числа позиций",
-  max_total_open_risk: "лимит суммарного риска",
-  correlated_exposure: "коррелированные позиции",
-  daily_loss_limit: "дневной лимит убытка",
-  weekly_loss_limit: "недельный лимит убытка",
+  not_rebalance_day: "не день ребалансировки",
   paused: "торговля на паузе",
-  market_closed: "рынок закрыт",
-  order_uncertain: "исход ордера неизвестен",
-  short_not_allowed: "шорт запрещён на рынке",
 };
 
 export const rejectLabel = (r: string | null): string => {
   if (!r) return "";
   if (r.startsWith("halted")) return "бот остановлен";
-  if (r.startsWith("regime_")) return `режим ${r.slice(7)}`;
-  if (r.startsWith("rr_too_low")) return "мало R:R";
-  if (r.startsWith("size_")) return `объём: ${r.slice(5)}`;
   return REJECTS[r] ?? r;
 };
+
+export const WEEKDAYS_FULL = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
+
+export const pct = (v: number | null | undefined, digits = 1): string =>
+  v === null || v === undefined ? "—" : `${num(v * 100, digits)}%`;

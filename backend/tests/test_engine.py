@@ -1,61 +1,47 @@
-"""Интеграция торгового движка: PostgreSQL + paper-брокер, полный цикл сделки."""
+"""Интеграция торгового движка: PostgreSQL + paper-брокер (спот), полный цикл портфеля."""
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-import pandas as pd
+import numpy as np
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.analysis.regime import Regime
 from app.brokers.base import CandleClosed
 from app.brokers.paper import PaperBroker
-from app.config import BACKEND_DIR
-from app.core.engine import TradingEngine
+from app.core.engine import DAY_MS, EVAL_GRACE_MS, TradingEngine
 from app.core.events import Event, EventBus
 from app.db.candles import upsert_instrument
 from app.db.models import OrderRow, SignalRow, TradeRow
 from app.db.repo import TradeRepo
 from app.domain import Candle, Direction, Timeframe
 from app.market.store import InMemoryCandleStore
-from app.strategy.base import MarketContext
-from app.strategy.ensemble import Signal, SignalEngine
 from app.trading_config import TradingConfig
 from tests.fakes import FakeMarketBroker
-from tests.synthetic import frame_to_candles, make_ohlcv, resample
 
 pytestmark = pytest.mark.db
 
-H = Timeframe.H1.ms
-M15 = Timeframe.M15.ms
-T0 = 1_700_006_400_000
-SYMBOL = "BTCUSDT"
-
-RAW = TradingConfig.load(BACKEND_DIR / "config" / "default.yaml").model_dump(mode="json")
-RAW["markets"] = {
-    "crypto": {**RAW["markets"]["crypto"], "symbols": [SYMBOL]},
-}
-RAW["strategy"]["stops"]["time_stop_bars"] = 24  # тесты тайм-стопа включают его явно
-CONFIG = TradingConfig.from_dict(RAW)
+SYMS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+HISTORY = 200
+# история заканчивается свечой среды: первый расчёт сразу ребалансирует (первый запуск),
+# следующий плановый — по закрытию воскресной свечи
+DAY0 = 1_700_006_400_000 // DAY_MS * DAY_MS
+while datetime.fromtimestamp((DAY0 + HISTORY * DAY_MS) / 1000, tz=UTC).weekday() != 3:
+    DAY0 += DAY_MS
+LAST = DAY0 + (HISTORY - 1) * DAY_MS  # открытие последней загруженной свечи
 
 
-class StubSignals(SignalEngine):
-    """Сигнал задаётся тестом; остальное (признаки, план, риск) — настоящее."""
-
-    def __init__(self) -> None:
-        super().__init__(CONFIG.strategy)
-        self.next: Direction | None = Direction.LONG
-        self.confidence = 90.0
-
-    def evaluate_last(
-        self, prepared: pd.DataFrame, symbol: str, ctx: MarketContext | None = None
-    ) -> Signal:
-        return Signal(
-            int(prepared.index[-1]), symbol, self.next, self.confidence, Regime.TREND_UP, "trend"
-        )
+def config(**risk: Any) -> TradingConfig:
+    return TradingConfig.from_dict(
+        {
+            "markets": {"crypto": {"market_type": "crypto", "category": "spot", "symbols": SYMS}},
+            "risk": {"profile": "custom", **risk} if risk else {},
+        }
+    )
 
 
 class Clock:
@@ -73,73 +59,73 @@ class Env:
     sm: async_sessionmaker[AsyncSession]
     events: list[Event]
     clock: Clock
-    last_close: float
     store: InMemoryCandleStore
     repo: TradeRepo
-    iid: int
+    ids: dict[str, int]
+    last: dict[str, float]
+    day: int  # открытие последней закрытой свечи
 
 
-async def make_engine(env: Env | None, sm: async_sessionmaker[AsyncSession]) -> Env:
+def series(drift: float, seed: int, n: int = HISTORY) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return 100 * np.exp(np.cumsum(rng.normal(drift, 0.02, n)))
+
+
+async def build(
+    sm: async_sessionmaker[AsyncSession], cfg: TradingConfig | None = None, env: Env | None = None
+) -> Env:
     if env is None:
-        n = 2600
-        h1 = make_ohlcv(n, drift=0.0008, vol=0.006, seed=4, start_ts=T0)
         store = InMemoryCandleStore()
-        await store.save_candles(SYMBOL, Timeframe.H1, frame_to_candles(h1))
-        await store.save_candles(
-            SYMBOL, Timeframe.H4, frame_to_candles(resample(h1, Timeframe.H1, Timeframe.H4))
-        )
-        m15 = make_ohlcv(
-            400,
-            vol=0.002,
-            seed=5,
-            tf=Timeframe.M15,
-            start_ts=T0 + n * H - 400 * M15,
-            start_price=float(h1["close"].iloc[-1]),
-        )
-        await store.save_candles(SYMBOL, Timeframe.M15, frame_to_candles(m15))
-        clock = Clock(T0 + n * H)
+        last = {}
+        for s, drift, seed in (
+            ("BTCUSDT", 0.004, 1),
+            ("ETHUSDT", 0.004, 2),
+            ("SOLUSDT", -0.006, 3),
+        ):
+            closes = series(drift, seed)
+            candles = [
+                Candle(DAY0 + i * DAY_MS, c, c * 1.01, c * 0.99, c, 1.0)
+                for i, c in enumerate(closes)
+            ]
+            await store.save_candles(s, Timeframe.D1, candles)
+            last[s] = float(closes[-1])
+        clock = Clock(LAST + DAY_MS + 60_000)
         paper = PaperBroker(
-            FakeMarketBroker(), initial_equity=Decimal(10_000), slippage_pct=Decimal(0), clock=clock
+            FakeMarketBroker(spot=True),
+            initial_equity=Decimal(10_000),
+            slippage_pct=Decimal(0),
+            clock=clock,
         )
-        last_close = float(h1["close"].iloc[-1])
-        await paper.on_candle(
-            SYMBOL, Candle(clock.now - M15, last_close, last_close, last_close, last_close, 1)
-        )
-        inst = await paper.get_instrument(SYMBOL)
-        async with sm() as s, s.begin():
-            iid = await upsert_instrument(s, "paper", inst)
         repo = TradeRepo(sm, "paper")
+        ids = {}
+        for s in SYMS:
+            async with sm() as ses, ses.begin():
+                ids[s] = await upsert_instrument(ses, "paper", await paper.get_instrument(s))
+        day = LAST
     else:
-        store, clock, paper, last_close, repo, iid = (
+        store, clock, paper, repo, ids, last, day = (
             env.store,
             env.clock,
             env.paper,
-            env.last_close,
             env.repo,
-            env.iid,
+            env.ids,
+            env.last,
+            env.day,
         )
-    bus = EventBus()
-    q = bus.subscribe()
     events: list[Event] = []
+    bus = EventBus()
     engine = TradingEngine(
-        config=CONFIG,
+        config=cfg or config(),
         brokers={"crypto": paper},
         store=store,
         repo=repo,
         bus=bus,
-        instrument_ids={SYMBOL: iid},
+        instrument_ids=ids,
         clock=clock,
     )
-    engine.signal_engine = StubSignals()
-    await engine.start()
-
-    async def drain() -> None:
-        while not q.empty():
-            events.append(q.get_nowait())
-
     engine.bus.publish = _tap(engine.bus.publish, events)  # type: ignore[method-assign]
-    await drain()
-    return Env(engine, paper, sm, events, clock, last_close, store, repo, iid)
+    await engine.start()
+    return Env(engine, paper, sm, events, clock, store, repo, ids, last, day)
 
 
 def _tap(publish: Any, sink: list[Event]) -> Any:
@@ -152,19 +138,25 @@ def _tap(publish: Any, sink: list[Event]) -> Any:
 
 @pytest.fixture
 async def env(db_sessionmaker: async_sessionmaker[AsyncSession]) -> AsyncIterator[Env]:
-    yield await make_engine(None, db_sessionmaker)
+    yield await build(db_sessionmaker)
 
 
-async def working_close(e: Env) -> None:
-    ts = e.clock.now - H
-    c = e.last_close
-    await e.engine.on_candle(CandleClosed(SYMBOL, Timeframe.H1, Candle(ts, c, c, c, c, 1)))
+async def close_day(e: Env, moves: dict[str, float] | None = None, day: int | None = None) -> None:
+    """Приходят закрытые дневные свечи всех монет (moves — изменение цены за день)."""
+    day = e.day if day is None else day
+    for s in SYMS:
+        if day > e.day:
+            e.last[s] *= 1 + (moves or {}).get(s, 0.004)
+            c = e.last[s]
+            await e.store.save_candles(s, Timeframe.D1, [Candle(day, c, c, c, c, 1.0)])
+        c = e.last[s]
+        await e.engine.on_candle(CandleClosed(s, Timeframe.D1, Candle(day, c, c, c, c, 1.0)))
+    e.day = day
 
 
-async def price(e: Env, o: float, h: float, lo: float, c: float) -> None:
-    e.clock.now += M15
-    candle = Candle(e.clock.now - M15, o, h, lo, c, 1)
-    await e.engine.on_candle(CandleClosed(SYMBOL, Timeframe.M15, candle))
+async def next_day(e: Env, moves: dict[str, float] | None = None) -> None:
+    e.clock.now += DAY_MS
+    await close_day(e, moves, e.day + DAY_MS)
 
 
 async def trades(e: Env) -> list[TradeRow]:
@@ -172,341 +164,203 @@ async def trades(e: Env) -> list[TradeRow]:
         return list((await s.scalars(select(TradeRow).order_by(TradeRow.id))).all())
 
 
-async def test_open_then_stop_loss(env: Env) -> None:
-    await working_close(env)
-    (t,) = await trades(env)
-    assert t.status == "open"
-    assert t.signal_id is not None
-    pos = env.paper.positions[SYMBOL]
-    assert pos.stop == t.stop_loss and pos.take_profit == t.tp2
-    assert pos.stop < t.entry_price < t.tp1 < t.tp2  # type: ignore[operator]
-    assert float(t.risk_amount) <= 100.0 + 1e-6  # 1% от 10k
-    async with env.sm() as s:
-        orders = list((await s.scalars(select(OrderRow).order_by(OrderRow.id))).all())
-    assert [o.purpose for o in orders] == ["entry", "tp1"]
-    assert all(o.status in ("Filled", "New") for o in orders)
-    assert any(e.type == "trade_opened" for e in env.events)
+async def orders(e: Env) -> list[OrderRow]:
+    async with e.sm() as s:
+        return list((await s.scalars(select(OrderRow).order_by(OrderRow.id))).all())
 
-    stop = float(t.stop_loss)
-    await price(env, stop + 1, stop + 2, stop - 5, stop - 3)
-    await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert t.status == "closed"
-    assert t.close_reason == "sl"
-    # объём считался с запасом на проскальзывание, в paper его нет — потеря чуть меньше 1R
-    assert t.r_multiple is not None
-    assert -1.0 <= t.r_multiple <= -0.85
-    assert SYMBOL not in env.engine.tracked
-    assert env.engine.risk.state.open == {}
+
+async def test_first_evaluation_buys_uptrend_coins(env: Env) -> None:
+    await close_day(env)
+    held = set(env.engine.holdings)
+    assert held == {"BTCUSDT", "ETHUSDT"}  # SOL падает — в кэше
+    assert env.engine.targets["SOLUSDT"] == 0
+    assert set(env.paper.positions) == held
+    ts = await trades(env)
+    assert {t.status for t in ts} == {"open"} and len(ts) == 2
+    for t in ts:
+        assert t.entry_price and t.qty > 0 and t.stop_loss is None
+        assert t.signal_id is not None  # владение связано с сигналом дня
+        assert float(t.fees) > 0  # комиссия спота 0.1%
+    assert all(o.status == "Filled" and o.side == "long" for o in await orders(env))
+    async with env.sm() as s:
+        sigs = list((await s.scalars(select(SignalRow))).all())
+    assert len(sigs) == 3 and all(sg.acted for sg in sigs)
+    # доли не превышают капитал; остаток — в USDT
+    bal = await env.paper.get_balance()
+    assert bal.available >= 0
+    kinds = [e.type for e in env.events]
+    assert kinds.count("trade_opened") == 2 and "rebalance" in kinds
+
+
+async def test_no_trades_between_rebalance_days(env: Env) -> None:
+    await close_day(env)
+    n = len(await orders(env))
+    for _ in range(3):  # чт, пт, сб — не день ребалансировки
+        await next_day(env)
+    assert len(await orders(env)) == n
+    async with env.sm() as s:
+        sigs = list((await s.scalars(select(SignalRow).where(SignalRow.acted.is_(False)))).all())
+    assert len(sigs) == 9 and {sg.reject_reason for sg in sigs} == {"not_rebalance_day"}
+
+
+async def test_trend_loss_sells_on_rebalance_day(env: Env) -> None:
+    await close_day(env)
+    for _ in range(3):
+        await next_day(env)
+    # воскресная свеча закрывается → понедельник: ETH рухнул за 30 дней
+    for _ in range(25):
+        env.clock.now += DAY_MS
+        env.day += DAY_MS
+        for s in SYMS:
+            env.last[s] *= 0.93 if s == "ETHUSDT" else 1.004
+            c = env.last[s]
+            await env.store.save_candles(s, Timeframe.D1, [Candle(env.day, c, c, c, c, 1.0)])
+            await env.engine.on_candle(
+                CandleClosed(s, Timeframe.D1, Candle(env.day, c, c, c, c, 1))
+            )
+    assert "ETHUSDT" not in env.engine.holdings
+    eth = [t for t in await trades(env) if t.instrument_id == env.ids["ETHUSDT"]]
+    closed = [t for t in eth if t.status == "closed"]
+    assert closed and closed[0].close_reason == "schedule"
+    assert float(closed[0].realized_pnl) < 0 and closed[0].exit_price is not None
+    assert closed[0].r_multiple is not None and closed[0].r_multiple < 0
+    assert "BTCUSDT" in env.engine.holdings
     assert any(e.type == "trade_closed" for e in env.events)
-    assert await env.repo.get_state("risk") is not None
 
 
-async def test_tp1_moves_stop_to_breakeven_then_tp2(env: Env) -> None:
-    await working_close(env)
-    (t,) = await trades(env)
-    tp1, tp2 = float(t.tp1), float(t.tp2)  # type: ignore[arg-type]
-    await price(env, tp1 - 1, tp1 + 1, tp1 - 2, tp1 + 0.5)
-    await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert t.tp1_done
-    assert float(t.stop_loss) > float(t.entry_price)  # type: ignore[arg-type]
-    assert env.paper.positions[SYMBOL].stop == t.stop_loss
-    await price(env, tp1 + 1, tp2 + 1, tp1, tp2 + 0.5)
-    await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert t.status == "closed" and t.close_reason == "tp2"
-    # 0.5×1.5R + 0.5×3R = 2.25R брутто; минус комиссии и запас на проскальзывание в R
-    assert t.r_multiple is not None
-    assert 1.8 <= t.r_multiple <= 2.25
+async def test_restart_restores_holdings_without_rebuying(
+    env: Env, db_sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    await close_day(env)
+    n = len(await orders(env))
+    again = await build(db_sessionmaker, env=env)
+    assert set(again.engine.holdings) == set(env.engine.holdings)
+    assert again.engine.last_rebalance == env.engine.last_rebalance
+    await close_day(again)  # тот же день ещё раз — не пересчитывается
+    assert len(await orders(again)) == n
 
 
-async def test_no_duplicate_entry_and_signals_logged(env: Env) -> None:
-    await working_close(env)
-    env.clock.now += H
-    await working_close(env)
-    assert len(await trades(env)) == 1
-    async with env.sm() as s:
-        sigs = list((await s.scalars(select(SignalRow).order_by(SignalRow.id))).all())
-    assert [sg.acted for sg in sigs] == [True, False]
-    assert sigs[1].reject_reason == "position_open"
-
-
-async def test_below_threshold_is_not_traded(env: Env) -> None:
-    assert isinstance(env.engine.signal_engine, StubSignals)
-    env.engine.signal_engine.confidence = 50
-    await working_close(env)
-    assert await trades(env) == []
-
-
-async def test_time_stop_closes_position(env: Env) -> None:
-    await working_close(env)
-    stub = env.engine.signal_engine
-    assert isinstance(stub, StubSignals)
-    stub.next = None
-    for _ in range(CONFIG.strategy.stops.time_stop_bars):
-        env.clock.now += H
-        await working_close(env)
-    await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert t.status == "closed"
-    assert t.close_reason == "time"
-
-
-async def test_missing_stop_is_restored(env: Env) -> None:
-    await working_close(env)
-    env.paper.positions[SYMBOL].stop = None
-    await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert env.paper.positions[SYMBOL].stop == t.stop_loss
-    assert any(e.data.get("kind") == "missing_stop" for e in env.events)
-
-
-async def test_kill_switch(env: Env) -> None:
-    await working_close(env)
+async def test_kill_switch_sells_everything(env: Env) -> None:
+    await close_day(env)
     await env.engine.kill_switch()
-    (t,) = await trades(env)
-    assert t.status == "closed" and t.close_reason == "kill"
+    assert env.engine.holdings == {} and env.paper.positions == {}
+    assert env.engine.paused and env.engine.risk.state.halted
+    assert {t.close_reason for t in await trades(env)} == {"kill"}
+    await next_day(env)  # в паузе новых покупок нет
     assert env.paper.positions == {}
-    assert env.engine.risk.state.halted
-    env.clock.now += H
-    await working_close(env)
-    assert len(await trades(env)) == 1  # после kill switch новых входов нет
 
 
-async def test_restart_recovers_open_trade(
-    env: Env, db_sessionmaker: async_sessionmaker[AsyncSession]
+async def test_manual_close_and_rebalance_now(env: Env) -> None:
+    await close_day(env)
+    await env.engine.close_manually("BTCUSDT")
+    assert "BTCUSDT" not in env.engine.holdings
+    btc = [t for t in await trades(env) if t.instrument_id == env.ids["BTCUSDT"]]
+    assert btc[0].close_reason == "manual"
+    await env.engine.rebalance_now()  # внеплановая — снова к целевым долям
+    assert "BTCUSDT" in env.engine.holdings
+    links = [o.link_id for o in await orders(env)]
+    assert len(links) == len(set(links))  # id ордеров не повторяются
+
+
+async def test_reconcile_syncs_wallet_and_detects_external_sale(env: Env) -> None:
+    await close_day(env)
+    env.paper.positions["BTCUSDT"].qty *= Decimal("0.999")  # комиссия списана в монете
+    env.paper.positions.pop("ETHUSDT")  # продали вручную на бирже
+    await env.engine.reconcile()
+    btc = env.engine.holdings["BTCUSDT"]
+    assert btc.qty == pytest.approx(float(env.paper.positions["BTCUSDT"].qty))
+    assert "ETHUSDT" not in env.engine.holdings
+    eth = [t for t in await trades(env) if t.instrument_id == env.ids["ETHUSDT"]]
+    assert eth[0].close_reason == "external"
+    assert any(e.type == "alert" and e.data.get("kind") == "holding_gone" for e in env.events)
+
+
+async def test_drawdown_stop_liquidates(db_sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    e = await build(db_sessionmaker, config(max_drawdown_stop_pct=10))
+    await close_day(e)
+    await e.engine.reconcile()  # пик капитала
+    for s in ("BTCUSDT", "ETHUSDT"):
+        e.last[s] *= 0.6
+        e.paper.mark_price(s, e.last[s], e.clock.now)
+        e.engine.prices[s] = e.last[s]
+    await e.engine.reconcile()
+    assert e.engine.risk.state.halted and e.engine.paused
+    assert e.engine.holdings == {}
+    assert {t.close_reason for t in await trades(e)} == {"drawdown_stop"}
+
+
+async def test_missed_evaluation_catches_up(env: Env) -> None:
+    await close_day(env)
+    n = len(await orders(env))
+    # свеча следующего дня сохранена, но событие потока не пришло
+    nxt = env.day + DAY_MS
+    for s in SYMS:
+        c = env.last[s]
+        await env.store.save_candles(s, Timeframe.D1, [Candle(nxt, c, c, c, c, 1.0)])
+    env.clock.now = nxt + DAY_MS + EVAL_GRACE_MS + 1
+    await env.engine.reconcile()
+    assert env.engine.last_eval["crypto"] == nxt
+    assert len(await orders(env)) == n  # не понедельник — только расчёт
+
+
+async def test_no_evaluation_on_stale_history(env: Env) -> None:
+    """Свеча дня есть не у всех монет (история не докачана) — расчёта и сделок нет,
+    пока данные не появятся."""
+    await close_day(env)
+    n = len(await orders(env))
+    nxt = env.day + DAY_MS
+    for s in ("BTCUSDT", "ETHUSDT"):  # у SOL свечи ещё нет
+        c = env.last[s]
+        await env.store.save_candles(s, Timeframe.D1, [Candle(nxt, c, c, c, c, 1.0)])
+    env.clock.now = nxt + DAY_MS + EVAL_GRACE_MS + 1
+    await env.engine.reconcile()
+    assert env.engine.last_eval["crypto"] == env.day  # не пересчитано
+    assert any(e.type == "alert" and e.data.get("kind") == "stale_data" for e in env.events)
+    c = env.last["SOLUSDT"]
+    await env.store.save_candles("SOLUSDT", Timeframe.D1, [Candle(nxt, c, c, c, c, 1.0)])
+    await env.engine.reconcile()
+    assert env.engine.last_eval["crypto"] == nxt
+    assert len(await orders(env)) == n
+
+
+async def test_foreign_coins_are_not_capital_and_not_sold(
+    db_sessionmaker: async_sessionmaker[AsyncSession],
 ) -> None:
-    await working_close(env)
-    restarted = await make_engine(env, db_sessionmaker)
-    assert SYMBOL in restarted.engine.tracked
-    tr = restarted.engine.tracked[SYMBOL]
-    (t,) = await trades(env)
-    assert tr.trade_id == t.id
-    assert tr.pos.stop == float(t.stop_loss)
-    assert SYMBOL in restarted.engine.risk.state.open
-
-
-async def test_unmanaged_position_alert(env: Env) -> None:
-    from app.brokers.base import OrderRequest
-
-    await env.paper.on_candle("ETHUSDT", Candle(env.clock.now, 10, 10, 10, 10, 1))
-    await env.paper.place_order(
-        OrderRequest(symbol="ETHUSDT", direction=Direction.LONG, qty=Decimal(1), link_id="manual")
+    e = await build(db_sessionmaker)
+    # до бота на счёте уже лежал SOL (монета из списка, но куплена не ботом)
+    sol = await e.paper.get_instrument("SOLUSDT")
+    e.paper.mark_price("SOLUSDT", e.last["SOLUSDT"], e.clock.now)
+    e.paper._execute(
+        sol,
+        "SOLUSDT",
+        Direction.LONG,
+        Decimal(10),
+        Decimal(str(e.last["SOLUSDT"])),
+        Decimal(0),
+        reduce_only=False,
     )
+    await close_day(e)
+    await e.engine.reconcile()
+    assert "SOLUSDT" not in e.engine.holdings
+    assert e.paper.positions["SOLUSDT"].qty == Decimal(10)  # чужие монеты не проданы
+    assert any(x.type == "alert" and x.data.get("kind") == "unmanaged_holding" for x in e.events)
+
+
+async def test_uncertain_buy_resolved_by_reconcile(env: Env) -> None:
+    await close_day(env)
+    btc = env.engine.holdings["BTCUSDT"]
+    # как будто ответ на покупку ETH потерялся: владение без объёма, монеты на счёте есть
+    eth = env.engine.holdings["ETHUSDT"]
+    eth.qty, eth.invested, eth.avg_entry = 0.0, 0.0, 0.0
     await env.engine.reconcile()
-    await env.engine.reconcile()
-    alerts = [e for e in env.events if e.data.get("kind") == "unmanaged_position"]
-    assert len(alerts) == 1
-
-
-# ------------------------------------------------------------------ регрессии по код-ревью
-async def test_tp1_failure_keeps_position_tracked(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.brokers.base import BrokerError, OrderRequest, OrderType
-
-    original = env.paper.place_order
-
-    async def no_limits(req: OrderRequest) -> Any:
-        if req.order_type is OrderType.LIMIT:
-            raise BrokerError("price out of range", code=110003)
-        return await original(req)
-
-    monkeypatch.setattr(env.paper, "place_order", no_limits)
-    await working_close(env)
-    (t,) = await trades(env)
-    assert t.status == "open"
-    tr = env.engine.tracked[SYMBOL]
-    assert tr.confirmed and tr.pos.tp1 is None and tr.pos.trailing_active()
-    assert SYMBOL in env.engine.risk.state.open
-    assert any(e.data.get("kind") == "tp1_failed" for e in env.events)
-
-
-async def test_unmanaged_exchange_position_blocks_entry(env: Env) -> None:
-    from app.brokers.base import OrderRequest
-
-    await env.paper.place_order(
-        OrderRequest(symbol=SYMBOL, direction=Direction.SHORT, qty=Decimal("0.01"), link_id="m")
+    assert env.engine.holdings["ETHUSDT"].qty == pytest.approx(
+        float(env.paper.positions["ETHUSDT"].qty)
     )
-    await working_close(env)
-    assert await trades(env) == []
-    async with env.sm() as s:
-        sig = await s.scalar(select(SignalRow))
-    assert sig is not None and sig.reject_reason == "exchange_position_exists"
-
-
-async def test_uncertain_entry_is_adopted_when_position_appears(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.brokers.base import BrokerError, OrderRequest, OrderType
-
-    original = env.paper.place_order
-
-    async def lost_response(req: OrderRequest) -> Any:
-        res = await original(req)
-        if req.order_type is OrderType.MARKET and not req.reduce_only:
-            raise BrokerError("network: read timeout")  # ордер исполнен, ответ потерян
-        return res
-
-    async def lookup_down(symbol: str, link_id: str) -> Any:
-        raise BrokerError("network: connect timeout")
-
-    monkeypatch.setattr(env.paper, "place_order", lost_response)
-    monkeypatch.setattr(env.paper, "get_order", lookup_down)
-    await working_close(env)
-    (t,) = await trades(env)
-    assert t.status == "pending"
-    assert not env.engine.tracked[SYMBOL].confirmed
-    # пока исход неизвестен — новых входов нет
-    env.clock.now += H
-    await working_close(env)
-    assert len(await trades(env)) == 1
+    assert env.engine.holdings["ETHUSDT"].avg_entry > 0
+    # а здесь покупка не дошла до биржи — запись отменяется
+    btc.qty, btc.invested = 0.0, 0.0
+    env.paper.positions.pop("BTCUSDT")
     await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert t.status == "open"
-    assert env.engine.tracked[SYMBOL].confirmed
-    assert SYMBOL in env.engine.risk.state.open
-
-
-async def test_uncertain_entry_cancelled_if_never_filled(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.brokers.base import BrokerError, OrderRequest
-    from app.core.engine import CONFIRM_ATTEMPTS
-
-    async def never(req: OrderRequest) -> Any:
-        raise BrokerError("network: read timeout")
-
-    async def not_found(symbol: str, link_id: str) -> Any:
-        return None
-
-    monkeypatch.setattr(env.paper, "place_order", never)
-    monkeypatch.setattr(env.paper, "get_order", not_found)
-    await working_close(env)
-    for _ in range(CONFIRM_ATTEMPTS):
-        await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert t.status == "cancelled" and t.close_reason == "not_filled"
-    assert SYMBOL not in env.engine.tracked
-
-
-async def test_failed_close_is_retried(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.brokers.base import BrokerError
-
-    await working_close(env)
-    stub = env.engine.signal_engine
-    assert isinstance(stub, StubSignals)
-    stub.next = None
-    executor = env.engine.executors["crypto"]
-    original = executor.close_position
-    calls = {"n": 0}
-
-    async def flaky(trade_id: int, symbol: str) -> None:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise BrokerError("service unavailable")
-        await original(trade_id, symbol)
-
-    monkeypatch.setattr(executor, "close_position", flaky)
-    for _ in range(CONFIG.strategy.stops.time_stop_bars):
-        env.clock.now += H
-        await working_close(env)
-    assert calls["n"] == 1
-    assert env.engine.tracked[SYMBOL].pending_reason is None  # не «застряла»
-    env.clock.now += H
-    await working_close(env)  # тайм-стоп срабатывает повторно
-    await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert t.status == "closed" and t.close_reason == "time"
-
-
-async def test_backfilled_candles_trigger_paper_stops(env: Env) -> None:
-    await working_close(env)
-    (t,) = await trades(env)
-    stop = float(t.stop_loss)
-    ts = env.clock.now
-    missed = [
-        Candle(ts, stop + 2, stop + 3, stop + 1, stop + 2, 1),
-        Candle(ts + M15, stop + 2, stop + 3, stop - 1, stop + 2, 1),  # стоп внутри пропуска
-        Candle(ts + 2 * M15, stop + 2, stop + 4, stop + 1, stop + 3, 1),
-    ]
-    env.clock.now += 3 * M15
-    await env.engine.on_backfill(SYMBOL, Timeframe.M15, missed)
-    await env.engine.reconcile()
-    (t,) = await trades(env)
-    assert t.status == "closed" and t.close_reason == "sl"
-
-
-async def test_restart_with_pending_trade_adopts_filled_position(
-    env: Env, db_sessionmaker: async_sessionmaker[AsyncSession]
-) -> None:
-    await working_close(env)
-    (t,) = await trades(env)
-    # имитируем падение процесса между исполнением входа и записью статуса open
-    await env.repo.update_trade(t.id, status="pending", entry_price=None)
-    restarted = await make_engine(env, db_sessionmaker)
-    (t,) = await trades(env)
-    assert t.status == "open"
-    assert restarted.engine.tracked[SYMBOL].confirmed
-
-
-async def test_circuit_breaker_pauses_after_api_errors(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.brokers.base import BrokerError
-
-    async def down() -> Any:
-        raise BrokerError("503")
-
-    monkeypatch.setattr(env.paper, "get_positions", down)
-    for _ in range(env.engine.breaker.max_errors):
-        await env.engine.reconcile()
-    assert env.engine.paused and env.engine.breaker.tripped
-    assert any(e.data.get("kind") == "circuit_breaker" for e in env.events)
-    env.engine.resume()
-    assert not env.engine.paused and not env.engine.breaker.tripped
-
-
-async def test_kill_switch_continues_after_one_close_fails(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.brokers.base import BrokerError, OrderRequest
-
-    await working_close(env)
-    await env.paper.on_candle("ETHUSDT", Candle(env.clock.now, 10, 10, 10, 10, 1))
-    await env.paper.place_order(
-        OrderRequest(symbol="ETHUSDT", direction=Direction.LONG, qty=Decimal(1), link_id="m")
-    )
-    original = env.paper.close_position
-
-    async def flaky(symbol: str, qty: Decimal | None = None) -> Any:
-        if symbol == "ETHUSDT":
-            raise BrokerError("rejected")
-        return await original(symbol, qty)
-
-    monkeypatch.setattr(env.paper, "close_position", flaky)
-    await env.engine.kill_switch()
-    assert SYMBOL not in env.paper.positions  # несмотря на сбой по ETHUSDT
-    assert any(e.data.get("kind") == "kill_failed" for e in env.events)
-
-
-async def test_split_take_profit_broker_gets_tp1_with_entry(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app.brokers.base import OrderRequest
-
-    seen: list[OrderRequest] = []
-    original = env.paper.place_order
-
-    async def spy(req: OrderRequest) -> Any:
-        seen.append(req)
-        return await original(req)
-
-    monkeypatch.setattr(env.paper, "place_order", spy)
-    monkeypatch.setattr(env.paper, "supports_split_take_profit", True)
-    await working_close(env)
-    assert len(seen) == 1  # без отдельной лимитки TP1
-    assert seen[0].partial_take_profit is not None
-    tr = env.engine.tracked[SYMBOL]
-    assert tr.pos.tp1 is not None and tr.tp1_link_id is not None
+    assert "BTCUSDT" not in env.engine.holdings
+    rows = {t.id: t for t in await trades(env)}
+    assert rows[btc.trade_id].status == "cancelled"

@@ -15,7 +15,7 @@ from app.domain import Timeframe
 from app.market.feed import wall_clock_ms
 from app.trading_config import TradingConfig
 from tests.fakes import FakeMarketBroker
-from tests.synthetic import frame_to_candles, make_ohlcv, resample
+from tests.synthetic import frame_to_candles, make_ohlcv
 
 pytestmark = pytest.mark.db
 
@@ -25,20 +25,12 @@ def setup_runtime(migrated_db: str, monkeypatch: pytest.MonkeyPatch) -> tuple[Bo
     raw["markets"] = {"crypto": {**raw["markets"]["crypto"], "symbols": ["BTCUSDT"]}}
     config = TradingConfig.from_dict(raw)
 
-    now = wall_clock_ms()
-    h1_ms = Timeframe.H1.ms
-    start = (now // h1_ms - 2600) * h1_ms
-    h1 = make_ohlcv(2600, vol=0.006, seed=1, start_ts=start)
-    m15 = make_ohlcv(2600 * 4, vol=0.003, seed=2, start_ts=start, tf=Timeframe.M15)
-    fake = FakeMarketBroker(
-        {
-            ("BTCUSDT", Timeframe.H1): frame_to_candles(h1),
-            ("BTCUSDT", Timeframe.H4): frame_to_candles(resample(h1, Timeframe.H1, Timeframe.H4)),
-            ("BTCUSDT", Timeframe.M15): frame_to_candles(m15),
-        }
-    )
-    last = frame_to_candles(h1)[-1]
-    fake.events = [CandleClosed("BTCUSDT", Timeframe.H1, last)]
+    day = Timeframe.D1.ms
+    start = (wall_clock_ms() // day - 300) * day
+    daily = make_ohlcv(300, drift=0.004, vol=0.02, seed=1, start_ts=start, tf=Timeframe.D1)
+    candles = frame_to_candles(daily)
+    fake = FakeMarketBroker({("BTCUSDT", Timeframe.D1): candles}, spot=True)
+    fake.events = [CandleClosed("BTCUSDT", Timeframe.D1, candles[-1])]
     paper = PaperBroker(fake, initial_equity=Decimal(5_000))
     monkeypatch.setattr(BotRuntime, "_make_broker", lambda self, market: (paper, fake))
 
@@ -61,14 +53,17 @@ async def test_runtime_start_feed_and_stop(
     async with db_sessionmaker() as s:
         candles = await s.scalar(select(func.count()).select_from(CandleRow))
         signals = await s.scalar(select(func.count()).select_from(SignalRow))
-    assert candles is not None and candles > 2500
-    assert signals is not None and signals >= 1
+        trades = list((await s.scalars(select(TradeRow))).all())
+    assert candles is not None and candles >= 299
+    assert signals == 1
+    # первый расчёт сразу ребалансирует: BTC в растущем тренде — куплен
+    assert len(trades) == 1 and trades[0].status == "open"
     types = set()
     while not q.empty():
         types.add(q.get_nowait().type)
-    assert {"bot_status", "equity", "signal"} <= types
+    assert {"bot_status", "equity", "signal", "trade_opened", "rebalance"} <= types
     repo_state = await runtime.repo.get_state("paper_broker:crypto")
-    assert repo_state is not None and Decimal(repo_state["cash"]) == Decimal(5_000)
+    assert repo_state is not None and Decimal(repo_state["cash"]) < Decimal(5_000)
 
 
 async def test_halted_state_is_loaded_before_first_candle(
@@ -77,23 +72,8 @@ async def test_halted_state_is_loaded_before_first_candle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Регрессия: свежая свеча при старте не должна обходить сохранённый kill switch."""
-    from app.analysis.regime import Regime
-    from app.domain import Direction
-    from app.risk.manager import RiskManager, RiskState
-    from app.strategy.ensemble import Signal, SignalEngine
-
     runtime, _ = setup_runtime(migrated_db, monkeypatch)
-    halted = RiskManager(
-        runtime.config.risk, state=RiskState(halted=True, halt_reason="kill_switch")
-    )
-    await runtime.repo.set_state("risk", halted.to_dict())
-
-    def always_long(
-        self: SignalEngine, prepared: object, symbol: str, ctx: object = None
-    ) -> Signal:
-        return Signal(0, symbol, Direction.LONG, 99.0, Regime.TREND_UP, "trend")
-
-    monkeypatch.setattr(SignalEngine, "evaluate_last", always_long)
+    await runtime.repo.set_state("risk", {"halted": True, "halt_reason": "kill_switch"})
     await runtime.start()
     await asyncio.sleep(0.3)
     await runtime.stop()
@@ -101,7 +81,7 @@ async def test_halted_state_is_loaded_before_first_candle(
         sig = await s.scalar(select(SignalRow))
         trades = await s.scalar(select(func.count()).select_from(TradeRow))
     assert trades == 0
-    assert sig is not None and sig.reject_reason == "halted:kill_switch"
+    assert sig is not None and not sig.acted and sig.reject_reason == "halted:kill_switch"
 
 
 def test_paper_mode_refuses_mainnet_keys() -> None:

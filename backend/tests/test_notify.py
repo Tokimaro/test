@@ -12,26 +12,32 @@ from app.risk.circuit import CircuitBreaker
 
 
 def test_format_events() -> None:
-    opened = format_event(
+    bought = format_event(
         Event(
             "trade_opened",
-            {
-                "symbol": "BTCUSDT",
-                "direction": "long",
-                "entry": 60000,
-                "stop": 59000,
-                "tp1": 61500,
-                "tp2": 63000,
-                "confidence": 77.4,
-                "strategy": "trend",
-            },
+            {"symbol": "BTCUSDT", "side": "buy", "qty": 0.05, "price": 60000, "weight": 0.184},
         )
     )
-    assert opened is not None and "LONG BTCUSDT" in opened and "77%" in opened
-    closed = format_event(
-        Event("trade_closed", {"symbol": "ETHUSDT", "pnl": -12.5, "r_multiple": -1, "reason": "sl"})
+    assert bought is not None and "Покупка BTCUSDT" in bought and "18.4%" in bought
+    sold = format_event(
+        Event("trade_updated", {"symbol": "ETHUSDT", "side": "sell", "qty": 1, "price": 3000})
     )
-    assert closed is not None and "-12.50" in closed and "-1.00R" in closed
+    assert sold is not None and "Продажа ETHUSDT" in sold
+    closed = format_event(
+        Event(
+            "trade_closed",
+            {"symbol": "ETHUSDT", "pnl": -12.5, "return_pct": -4.1, "reason": "schedule"},
+        )
+    )
+    assert closed is not None and "-12.50" in closed and "-4.10%" in closed
+    rebalance = format_event(
+        Event(
+            "rebalance",
+            {"orders": [{"side": "buy", "symbol": "SOLUSDT", "qty": 2, "price": 150}]},
+        )
+    )
+    assert rebalance is not None and "Ребалансировка" in rebalance and "SOLUSDT" in rebalance
+    assert format_event(Event("rebalance", {"orders": []})) is None
     assert format_event(Event("equity", {"equity": 1})) is None
 
 
@@ -39,7 +45,8 @@ class FakeEngine:
     def __init__(self) -> None:
         self.paused = False
         self.killed = False
-        self.tracked: dict[str, Any] = {}
+        self.holdings: dict[str, Any] = {}
+        self.targets: dict[str, float] = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -47,7 +54,7 @@ class FakeEngine:
             "halted": self.killed,
             "halt_reason": None,
             "open_positions": 0,
-            "risk_pct": 1.0,
+            "target_vol_pct": 25.0,
             "drawdown_pct": 0.0,
         }
 

@@ -1,313 +1,128 @@
-from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
-from itertools import pairwise
 
 import numpy as np
+import pandas as pd
 import pytest
 
-from app.analysis.regime import Regime
-from app.backtest.engine import (
-    FUNDING_PERIOD_MS,
-    Backtester,
-    BacktestResult,
-    BacktestSettings,
-    PreparedSymbol,
-    SymbolData,
-)
-from app.backtest.metrics import monte_carlo_drawdown, summarize
-from app.backtest.walk_forward import walk_forward
-from app.config import BACKEND_DIR
-from app.domain import Direction, Instrument, MarketType, Timeframe
-from app.strategy.ensemble import Signal
+from app.backtest.engine import Backtester, BacktestResult, BacktestSettings, SymbolData
+from app.backtest.metrics import equity_stats, summarize, trade_stats
+from app.domain import Instrument, MarketType
+from app.research import strategies as research
 from app.trading_config import TradingConfig
-from tests.synthetic import make_ohlcv, resample
 
-H = Timeframe.H1.ms
-T0 = 1_700_006_400_000  # кратно 8 часам (00:00 UTC)
-CONFIG = TradingConfig.load(BACKEND_DIR / "config" / "default.yaml")
-MARKET = CONFIG.markets["crypto"]
-
-INST = Instrument(
-    symbol="TEST",
-    market_type=MarketType.CRYPTO,
-    category="linear",
-    tick_size=Decimal("0.01"),
-    qty_step=Decimal("0.001"),
-    min_qty=Decimal("0.001"),
-    max_qty=Decimal(1_000_000),
-    max_leverage=Decimal(50),
-    taker_fee=Decimal(0),
-)
+DAY = 86_400_000
+T0 = 1_577_836_800_000  # 2020-01-01 (среда)
+SYMS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 
 
-def manual_symbol(
-    bars: list[tuple[float, float, float, float]],
-    signal_at: int = 0,
-    direction: Direction = Direction.LONG,
-    atr: float = 2.0,
-    strategy: str = "trend",
-) -> PreparedSymbol:
-    """Свечи (o, h, l, c) и сильный сигнал на закрытии свечи signal_at."""
-    n = len(bars)
-    arr = np.array(bars, dtype=float)
-    nan = np.full(n, np.nan)
-    cols = {
-        "open": arr[:, 0],
-        "high": arr[:, 1],
-        "low": arr[:, 2],
-        "close": arr[:, 3],
-        "atr": np.full(n, atr),
-        "swing_low": nan,
-        "swing_high": nan,
-        "bb_mid": nan,
-        "chand_long": nan,
-        "chand_short": nan,
-    }
-    index = T0 + np.arange(n, dtype="int64") * H
-    signals = [
-        Signal(
-            int(index[i]),
-            "TEST",
-            direction if i == signal_at else None,
-            90.0 if i == signal_at else 0.0,
-            Regime.TREND_UP,
-            strategy,
-        )
-        for i in range(n)
-    ]
-    return PreparedSymbol("TEST", INST, index, cols, signals)
+def inst(symbol: str, fee: str = "0.001") -> Instrument:
+    return Instrument(
+        symbol,
+        MarketType.CRYPTO,
+        "spot",
+        tick_size=Decimal("1e-8"),
+        qty_step=Decimal("1e-8"),
+        min_qty=Decimal("1e-8"),
+        max_qty=Decimal("1e15"),
+        taker_fee=Decimal(fee),
+        maker_fee=Decimal(fee),
+    )
+
+
+def closes(n: int = 700, seed: int = 0, drift: float = 0.001) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    data = 100 * np.exp(np.cumsum(rng.normal(drift, 0.03, (n, len(SYMS))), axis=0))
+    return pd.DataFrame(data, index=pd.Index(T0 + np.arange(n) * DAY), columns=SYMS)
 
 
 def run(
-    sym: PreparedSymbol, taker_fee: float | None = None, slippage_pct: float = 0.0
-) -> BacktestResult:
-    settings = BacktestSettings(
-        initial_equity=10_000,
-        slippage_pct=slippage_pct,
-        funding_rate_8h=0.0,
-        taker_fee=taker_fee,
+    c: pd.DataFrame, fee: str = "0.001", slippage: float = 0.0005, **risk: float
+) -> tuple[Backtester, BacktestResult]:
+    cfg = TradingConfig.from_dict(
+        {
+            "markets": {"crypto": {"market_type": "crypto", "category": "spot", "symbols": SYMS}},
+            "risk": {"profile": "custom", **risk} if risk else {},
+        }
     )
-    return Backtester(CONFIG, MARKET, settings).run([sym])
+    data = [SymbolData(s, inst(s, fee), pd.DataFrame({"close": c[s]})) for s in SYMS]
+    bt = Backtester(cfg, cfg.markets["crypto"], BacktestSettings(slippage_pct=slippage))
+    return bt, bt.run(bt.prepare(data))
 
 
-FLAT = (100.0, 100.5, 99.5, 100.0)
-# вход по открытию свечи 1 = 100; стоп 97 (1.5 ATR), TP1 104.5, TP2 109
-
-
-def test_stop_loss_is_minus_one_r() -> None:
-    res = run(manual_symbol([FLAT, FLAT, (100, 100.5, 96, 96.5), FLAT]))
-    (t,) = res.trades
-    assert t.close_reason == "sl"
-    assert t.exit == pytest.approx(97.0)
-    assert t.r_multiple == pytest.approx(-1.0, abs=0.01)
-    assert t.risk_amount <= 100.0  # 1% от 10k
-    assert res.final_equity == pytest.approx(10_000 + t.pnl)
-
-
-def test_stop_and_target_in_same_bar_counts_as_stop() -> None:
-    res = run(manual_symbol([FLAT, FLAT, (100, 110, 96, 105), FLAT]))
-    assert res.trades[0].close_reason == "sl"
-
-
-def test_tp1_then_tp2() -> None:
-    res = run(manual_symbol([FLAT, FLAT, (100, 105, 99.8, 104.8), (104.8, 110, 104, 109.5), FLAT]))
-    (t,) = res.trades
-    assert t.close_reason == "tp2"
-    # половина на 1.5R, половина на 3R
-    assert t.r_multiple == pytest.approx(2.25, abs=0.03)
-
-
-def test_tp1_then_breakeven_in_bearish_bar() -> None:
-    # медвежья свеча: сначала high (TP1), затем low ниже безубытка
-    res = run(manual_symbol([FLAT, FLAT, (101, 105, 99.9, 100.2), FLAT]))
-    (t,) = res.trades
-    assert t.close_reason == "be"
-    assert t.r_multiple == pytest.approx(0.75, abs=0.02)  # 0.5 × 1.5R + 0.5 × 0
-
-
-def test_tp1_in_bullish_bar_keeps_position() -> None:
-    # бычья свеча: low был до high → безубыток в этой свече не срабатывает
-    res = run(manual_symbol([FLAT, FLAT, (100, 105, 99.9, 104.9), *[FLAT] * 3]))
-    (t,) = res.trades
-    # закрыт по безубытку на следующей свече, а не в свече TP1
-    assert t.close_reason == "be"
-    assert t.bars_held >= 2
-
-
-def test_gap_through_stop_fills_at_open() -> None:
-    res = run(manual_symbol([FLAT, FLAT, (94, 95, 93, 94.5), FLAT]))
-    (t,) = res.trades
-    assert t.exit == pytest.approx(94.0)
-    assert t.r_multiple < -1.5
-
-
-def test_signal_invalidated_by_gap_is_skipped() -> None:
-    res = run(manual_symbol([FLAT, (96, 97, 95, 96)]))
-    assert res.trades == []
-    assert res.signal_stats.get("skip_gap") == 1
-
-
-def test_time_stop_optional() -> None:
-    # по умолчанию тайм-стопа нет: сделка идёт до стопа/цели (здесь — до конца данных)
-    assert CONFIG.strategy.stops.time_stop_bars == 0
-    assert run(manual_symbol([FLAT] * 40)).trades[0].close_reason == "end"
-    raw = CONFIG.model_dump(mode="json")
-    raw["strategy"]["stops"]["time_stop_bars"] = 24
-    cfg = TradingConfig.from_dict(raw)
-    res = Backtester(cfg, MARKET, BacktestSettings(slippage_pct=0, funding_rate_8h=0)).run(
-        [manual_symbol([FLAT] * 40)]
+def test_rebalances_only_on_monday_after_first_day() -> None:
+    c = closes()
+    _, res = run(c)
+    assert res.signal_stats["rebalances"] == 1 + sum(
+        datetime.fromtimestamp((ts + DAY) / 1000, tz=UTC).weekday() == 0 for ts in c.index[1:]
     )
-    (t,) = res.trades
-    assert t.close_reason == "time"
-    assert t.bars_held == 24
+    days = {datetime.fromtimestamp(t.entry_ts / 1000, tz=UTC).weekday() for t in res.trades}
+    days.discard(datetime.fromtimestamp((T0 + DAY) / 1000, tz=UTC).weekday())  # первый день
+    assert days <= {0}
 
 
-def test_short_mirror() -> None:
-    res = run(
-        manual_symbol(
-            [FLAT, FLAT, (100, 100.2, 95, 95.3), (95.3, 96, 90, 90.5), FLAT],
-            direction=Direction.SHORT,
-        )
-    )
-    (t,) = res.trades
-    assert t.direction == "short"
-    assert t.close_reason == "tp2"
-    assert t.r_multiple == pytest.approx(2.25, abs=0.03)
-
-
-def test_fees_and_slippage_reduce_pnl_and_are_accounted() -> None:
-    bars = [FLAT, FLAT, (100, 105, 99.8, 104.8), (104.8, 110, 104, 109.5), FLAT]
-    clean = run(manual_symbol(bars))
-    costly = run(manual_symbol(bars), taker_fee=0.001, slippage_pct=0.001)
-    assert costly.trades[0].pnl < clean.trades[0].pnl
-    assert costly.trades[0].fees > 0
-    assert costly.final_equity == pytest.approx(10_000 + costly.trades[0].pnl)
-
-
-def test_funding_charged_every_8h_for_longs() -> None:
-    bars = [FLAT] * 20
-    sym = manual_symbol(bars)
-    settings = BacktestSettings(slippage_pct=0, funding_rate_8h=0.001)
-    res = Backtester(CONFIG, MARKET, settings).run([sym])
-    (t,) = res.trades
-    boundaries = sum(
-        1 for i in range(2, 20) if (T0 + i * H) % FUNDING_PERIOD_MS == 0 and i < 1 + t.bars_held
-    )
-    assert boundaries >= 1
-    assert t.funding == pytest.approx(boundaries * t.qty * 100 * 0.001, rel=1e-6)
-
-
-def test_mean_reversion_single_target() -> None:
-    sym = manual_symbol([FLAT, FLAT, (100, 108.5, 99.5, 108), FLAT], strategy="mean_reversion")
-    sym.cols["bb_mid"] = np.full(4, 108.0)
-    res = run(sym)
-    (t,) = res.trades
-    assert t.close_reason == "tp2"
-    assert t.r_multiple == pytest.approx(8 / 3, abs=0.02)
-
-
-# ------------------------------------------------------------------ интеграция
-@pytest.fixture(scope="module")
-def synthetic_run():  # type: ignore[no-untyped-def]
-    n = 6000
-    rng = np.random.default_rng(3)
-    data = []
-    for k, sym in enumerate(["BTCUSDT", "ETHUSDT", "SOLUSDT"]):
-        # чередующиеся трендовые и боковые участки
-        drifts = np.repeat(rng.choice([-0.002, 0.0, 0.0, 0.002], size=n // 500), 500)
-        h1 = make_ohlcv(n, drifts=drifts, vol=0.008, seed=10 + k, start_ts=T0)
-        data.append(
-            SymbolData(
-                sym,
-                replace(INST, symbol=sym, taker_fee=Decimal("0.00055")),
-                h1,
-                resample(h1, Timeframe.H1, Timeframe.H4),
-                None,
-            )
-        )
-    bt = Backtester(CONFIG, MARKET, BacktestSettings())
-    prepared = bt.prepare(data)
-    return bt, prepared, bt.run(prepared)
-
-
-def test_integration_invariants(synthetic_run) -> None:  # type: ignore[no-untyped-def]
-    _, _, res = synthetic_run
-    assert len(res.trades) > 20
-    # капитал сходится с суммой сделок
-    assert res.final_equity == pytest.approx(10_000 + sum(t.pnl for t in res.trades), rel=1e-9)
-    # потеря на сделку не больше ~1R (+ издержки, funding), гэпов в синтетике нет
-    assert min(t.r_multiple for t in res.trades) > -1.3
-    # по каждому инструменту позиции не пересекаются во времени
-    for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
-        ts = sorted((t.entry_ts, t.exit_ts) for t in res.trades if t.symbol == sym)
-        assert all(a[1] <= b[0] for a, b in pairwise(ts))
-    # одновременно открыто не больше max_open_positions
-    events = sorted([(t.entry_ts, 1) for t in res.trades] + [(t.exit_ts, -1) for t in res.trades])
-    open_now, peak = 0, 0
-    for _, d in events:
-        open_now += d
-        peak = max(peak, open_now)
-    assert peak <= CONFIG.risk.max_open_positions
-    assert all(t.confidence >= CONFIG.risk.confidence_threshold for t in res.trades)
-
-
-def test_summary_and_monte_carlo(synthetic_run) -> None:  # type: ignore[no-untyped-def]
-    _, _, res = synthetic_run
+def test_trades_are_holding_episodes_and_equity_consistent() -> None:
+    _, res = run(closes())
+    assert res.trades and all(t.direction == "long" for t in res.trades)
+    assert all(t.risk_amount > 0 and t.fees > 0 for t in res.trades)
+    net = sum(t.pnl for t in res.trades)
+    # после закрытия всех владений весь результат — это сумма сделок
+    assert res.final_equity == pytest.approx(res.initial_equity + net, rel=1e-9)
     rep = summarize(res)
-    s = rep["summary"]
-    assert s["trades"] == len(res.trades)
-    assert 0 <= s["win_rate"] <= 100
-    assert s["max_drawdown_pct"] >= 0
-    assert set(rep["by_symbol"]) <= {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
-    assert sum(b["trades"] for b in rep["calibration"]) == len(res.trades)
-    mc = monte_carlo_drawdown([t.r_multiple for t in res.trades], 1.0, runs=200)
-    assert mc["dd_median_pct"] <= mc["dd_p95_pct"] <= mc["dd_max_pct"]
+    assert rep["summary"]["trades"] == len(res.trades)
+    assert set(rep["by_symbol"]) <= set(SYMS)
 
 
-def test_walk_forward_uses_only_oos(synthetic_run) -> None:  # type: ignore[no-untyped-def]
-    bt, prepared, _ = synthetic_run
-    month = 30 * 86_400_000
-    wf = walk_forward(
-        bt,
-        prepared,
-        thresholds=(60, 70, 80),
-        in_sample_ms=2 * month,
-        out_of_sample_ms=month,
-        min_trades=3,
+def test_costs_reduce_result() -> None:
+    c = closes()
+    _, free = run(c, fee="0", slippage=0)
+    _, paid = run(c)
+    assert paid.final_equity < free.final_equity
+
+
+def test_matches_independent_hold_between_rebalances() -> None:
+    """Без издержек и порога капитал бота совпадает с независимой формулой: в день
+    ребалансировки r — доли w_r из исследовательского кода, до следующей ребалансировки
+    монеты просто держатся: V_t = V_r × (1 − Σw + Σ w_i · P_i,t / P_i,r)."""
+    c = closes(n=900, seed=5)
+    cfg = TradingConfig.from_dict(
+        {
+            "markets": {"crypto": {"market_type": "crypto", "category": "spot", "symbols": SYMS}},
+            "risk": {},
+            "strategy": {"min_trade_pct": 0},
+        }
     )
-    assert wf.windows
-    for w in wf.windows:
-        assert all(w.oos_start <= t.entry_ts <= w.oos_end for t in w.oos_trades)
-        assert w.best_threshold in (60, 70, 80)
-    assert wf.summary["trades"] == len(wf.oos_trades)
-
-
-def test_no_edge_on_random_walk() -> None:
-    """Защита от заглядывания в будущее: на случайном блуждании без тренда у системы
-    не может быть преимущества — ожидание должно быть около нуля или ниже (издержки)."""
-    data = []
-    for k in range(6):
-        sym = f"RW{k}"
-        h1 = make_ohlcv(6000, drift=0.0, vol=0.008, seed=100 + k, start_ts=T0)
-        data.append(
-            SymbolData(
-                sym,
-                replace(INST, symbol=sym, taker_fee=Decimal("0.00055")),
-                h1,
-                resample(h1, Timeframe.H1, Timeframe.H4),
-            )
-        )
-    bt = Backtester(CONFIG, MARKET, BacktestSettings())
+    data = [SymbolData(s, inst(s, "0"), pd.DataFrame({"close": c[s]})) for s in SYMS]
+    bt = Backtester(cfg, cfg.markets["crypto"], BacktestSettings(slippage_pct=0))
     res = bt.run(bt.prepare(data))
-    s = summarize(res)["summary"]
-    assert s["trades"] >= 50
-    assert s["expectancy_r"] < 0.1
-    assert isinstance(s["total_return_pct"], float)
+    w = research.tsmom(c, 365, long_only=True, rebalance=1)
+    p = c.to_numpy()
+    v, ref = 10_000.0, []
+    wr, pr = np.zeros(len(SYMS)), p[0]
+    for i, ts in enumerate(c.index):
+        v_now = v * (1 - wr.sum() + (wr * p[i] / pr).sum())
+        if i == 0 or datetime.fromtimestamp((ts + DAY) / 1000, tz=UTC).weekday() == 0:
+            v, wr, pr = v_now, w.iloc[i].to_numpy(), p[i]
+        ref.append(v_now)
+    ours = [e for _, e in res.equity_curve]
+    np.testing.assert_allclose(ours[:-1], ref[:-1], rtol=1e-6)
 
 
-def test_tp1_and_tp2_in_bearish_bar_takes_tp2_before_reversal() -> None:
-    # медвежья свеча O→H→L→C: обе цели на вершине, затем падение ниже безубытка
-    res = run(manual_symbol([FLAT, FLAT, (101, 110, 99.0, 99.5), FLAT]))
-    (t,) = res.trades
-    assert t.close_reason == "tp2"
-    assert t.r_multiple == pytest.approx(2.25, abs=0.03)
+def test_drawdown_stop_goes_to_cash() -> None:
+    c = closes(drift=0.002)
+    crash = np.r_[np.linspace(1, 0.4, 5), np.full(len(c) - 405, 0.4)]
+    c.iloc[400:] = c.iloc[400:] * crash[:, None]  # обвал на 60% за 5 дней
+    _, res = run(c, max_drawdown_stop_pct=25)
+    assert res.signal_stats.get("drawdown_stop") == 1
+    assert any(t.close_reason == "drawdown_stop" for t in res.trades)
+    stop_ts = max(t.exit_ts for t in res.trades if t.close_reason == "drawdown_stop")
+    after = [e for ts, e in res.equity_curve if ts > stop_ts]
+    assert max(after) == pytest.approx(min(after))  # дальше — только кэш
+
+
+def test_equity_and_trade_stats() -> None:
+    _, res = run(closes())
+    st = equity_stats(res.equity_curve, res.initial_equity, DAY)
+    assert {"sharpe", "cagr_pct", "max_drawdown_pct"} <= set(st)
+    ts = trade_stats(res.trades)
+    assert 0 <= ts["win_rate"] <= 100 and "avg_return_pct" in ts
