@@ -154,3 +154,77 @@ def test_htf_bias_on_higher_working_timeframe_is_causal(tf: str) -> None:
     # значение на баре i известно после его закрытия — это знак close[i] − EMA
     diff = df["close"] - it.ema(df["close"], 5)
     assert (np.sign(diff.to_numpy())[20:] == bias.to_numpy()[20:]).all()
+
+
+def test_first_filled_limit_wins_not_earliest_signal() -> None:
+    """Старая лимитка A (глубже) и свежая B: B исполняется раньше — сделка по B, A снимается.
+    Ранняя версия симулятора брала A, «зная», что она дождётся исполнения."""
+    rows = [(100, 100, 100, 100)] * 3 + [
+        (100, 100, 99.4, 99.6),  # 3: касание лимитки B (99.5)
+        (99.6, 99.7, 98.4, 98.6),  # 4: стоп B (98.9) и касание лимитки A (98.5)
+        (98.6, 103, 98.6, 102),  # 5: тейк A был бы здесь
+    ]
+    df = bars(rows)
+    s = pd.concat(
+        [
+            sig(i=1, limit=98.5, sl=97.0, tp=101.0, expiry=10),  # A
+            sig(i=2, limit=99.5, sl=98.9, tp=101.0, expiry=10),  # B
+        ]
+    )
+    t = it.simulate(df, s)
+    assert len(t) == 1
+    assert t.loc[0, "entry"] == 99.5 and t.loc[0, "reason"] == "sl"
+
+
+def _reference(df: pd.DataFrame, s: pd.DataFrame) -> list[tuple[int, float, float]]:
+    """Побарная эталонная симуляция: активные ордера, первая исполнившаяся — вход."""
+    o, h, lo = (df[k].to_numpy() for k in ("open", "high", "low"))
+    by_i: dict[int, list] = {}  # type: ignore[type-arg]
+    for pos_i, r in zip(s["i"].to_numpy(dtype=int), s.itertuples(index=False), strict=True):
+        by_i.setdefault(int(pos_i), []).append(r)
+    active: list = []  # type: ignore[type-arg]
+    pos = None
+    out = []
+    for t in range(len(o)):
+        if pos is not None:
+            d, px, sl, tp, j = pos
+            if t > j:
+                if lo[t] <= sl if d > 0 else h[t] >= sl:
+                    out.append((t, px, sl if (o[t] - sl) * d > 0 else o[t]))
+                    pos = None
+                elif h[t] >= tp if d > 0 else lo[t] <= tp:
+                    out.append((t, px, tp))
+                    pos = None
+        else:
+            active = [a for a in active if t <= a[0] + int(a[1].expiry)]
+            for a in active:
+                r = a[1]
+                if lo[t] <= r.limit if r.dir > 0 else h[t] >= r.limit:
+                    d = int(r.dir)
+                    px = min(o[t], r.limit) if d > 0 else max(o[t], r.limit)
+                    active = []
+                    if (px - r.sl) * d > 0:
+                        pos = (d, px, r.sl, r.tp, t)
+                        if lo[t] <= r.sl if d > 0 else h[t] >= r.sl:
+                            out.append((t, px, r.sl))
+                            pos = None
+                    break
+        if pos is None:
+            active += [(t, r) for r in by_i.get(t, [])]
+    return out
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_simulate_matches_bar_by_bar_reference(seed: int) -> None:
+    df = random_bars(3000, seed)
+    s = it.fvg_retest(df, rr=2.0, use_bias=False, min_gap_atr=0.0)
+    assert len(s) > 100  # много пересекающихся лимиток
+    t = it.simulate(df, s)
+    ref = _reference(df, s)
+    got = [
+        (df.index.get_loc(x), e, ex)
+        for x, e, ex in zip(t["exit_ts"], t["entry"], t["exit"], strict=True)
+    ]
+    assert len(got) == len(ref)
+    for (k1, e1, x1), (k2, e2, x2) in zip(got, ref, strict=True):
+        assert k1 == k2 and e1 == pytest.approx(e2) and x1 == pytest.approx(x2)

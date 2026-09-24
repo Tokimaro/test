@@ -151,6 +151,12 @@ def _first_hit(mask_fn: Callable[[int, int], np.ndarray], start: int, end: int) 
 def simulate(df: pd.DataFrame, signals: pd.DataFrame, fill_through: float = 0.0) -> pd.DataFrame:
     """Прогон сигналов по барам. Возвращает сделки с gross R и ценами для расчёта издержек.
 
+    Несколько неисполненных лимиток могут висеть одновременно: сделку открывает та, что
+    исполнилась ПЕРВОЙ, остальные снимаются; сигналы во время открытой сделки пропускаются.
+    (Ранняя версия брала самый ранний сигнал, исполнившийся когда-нибудь, — это заглядывание в
+    будущее: она «знала», что старая лимитка дождётся глубокого отката, и пропускала сделки по
+    более свежим лимиткам, которые исполнились бы раньше. См. docs/intraday-strategies.md.)
+
     fill_through — насколько (доля цены) рынок должен пройти ЗА лимитную цену, чтобы ордер
     считался исполненным: 0 — исполнение при касании (оптимистично, очередь не учитывается)."""
     o = df["open"].to_numpy(dtype=float)
@@ -159,33 +165,61 @@ def simulate(df: pd.DataFrame, signals: pd.DataFrame, fill_through: float = 0.0)
     c = df["close"].to_numpy(dtype=float)
     n = len(o)
     trades: list[tuple[Any, ...]] = []
-    busy_until = -1
     sig = signals.sort_values("i", kind="stable")
     cols = {k: sig[k].to_numpy(dtype=float) for k in SIGNAL_COLUMNS}
-    for row in range(len(sig)):
+    m = len(sig)
+
+    # 1) момент исполнения каждого ордера, как если бы он был единственным
+    fill_bar = np.full(m, -1, dtype=np.int64)
+    fill_px = np.full(m, np.nan)
+    for row in range(m):
         i, d = int(cols["i"][row]), int(cols["dir"][row])
-        if i <= busy_until or i + 1 >= n:
+        if i + 1 >= n:
             continue
-        sl, tp, lim = cols["sl"][row], cols["tp"][row], cols["limit"][row]
-        max_bars = int(cols["max_bars"][row])
-        # --- вход ---
-        limit_entry = not np.isnan(lim)
-        if not limit_entry:
-            j, px = i + 1, o[i + 1]
-        else:
-            end = min(n, i + 1 + int(cols["expiry"][row]))
+        lim = cols["limit"][row]
+        if np.isnan(lim):
+            fill_bar[row], fill_px[row] = i + 1, o[i + 1]
+            continue
+        end = min(n, i + 1 + int(cols["expiry"][row]))
+        trigger = lim * (1 - d * fill_through)
 
-            trigger = lim * (1 - d * fill_through)
+        def touch(a: int, b: int, d: int = d, trigger: float = trigger) -> np.ndarray:
+            return lo[a:b] <= trigger if d > 0 else h[a:b] >= trigger
 
-            def touch(a: int, b: int, d: int = d, trigger: float = trigger) -> np.ndarray:
-                return lo[a:b] <= trigger if d > 0 else h[a:b] >= trigger
+        j = _first_hit(touch, i + 1, end)
+        if j >= 0:
+            fill_bar[row] = j
+            fill_px[row] = min(o[j], lim) if d > 0 else max(o[j], lim)
 
-            j = _first_hit(touch, i + 1, end)
-            if j < 0:
+    # 2) сделки по очереди: из ордеров, выставленных после закрытия прошлой сделки,
+    #    срабатывает тот, что исполнился раньше всех; остальные снимаются
+    sig_i = cols["i"].astype(np.int64)
+    busy_until = -1
+    p = 0
+    while p < m:
+        best = -1
+        for row in range(p, m):
+            if sig_i[row] <= busy_until:
                 continue
-            px = min(o[j], lim) if d > 0 else max(o[j], lim)
+            if best >= 0 and sig_i[row] >= fill_bar[best]:
+                break  # выставлен после лучшего исполнения — уже не успеет
+            if fill_bar[row] >= 0 and (best < 0 or fill_bar[row] < fill_bar[best]):
+                best = row
+        if best < 0:
+            break
+        row = best
+        i, d = int(sig_i[row]), int(cols["dir"][row])
+        j, px = int(fill_bar[row]), float(fill_px[row])
+        sl, tp = cols["sl"][row], cols["tp"][row]
+        max_bars = int(cols["max_bars"][row])
+        limit_entry = not np.isnan(cols["limit"][row])
+        # остальные ордера сняты в момент исполнения; сигнал на свече, где позиция уже
+        # закрылась, допустим (ордер ставится на её закрытии)
         risk = (px - sl) * d
         if not risk > 0 or (not np.isnan(tp) and (tp - px) * d <= 0):
+            # открылись уже за стопом/тейком — позиция закрылась бы на той же свече
+            busy_until = j - 1
+            p = int(np.searchsorted(sig_i, busy_until, side="right"))
             continue
         # --- выход ---
         end = n if not max_bars else min(n, j + max_bars)
@@ -225,7 +259,8 @@ def simulate(df: pd.DataFrame, signals: pd.DataFrame, fill_through: float = 0.0)
         trades.append(
             (df.index[i], df.index[k], d, px, exit_px, sl, risk, reason, k - j + 1, limit_entry)
         )
-        busy_until = k
+        busy_until = k - 1
+        p = int(np.searchsorted(sig_i, busy_until, side="right"))
     out = pd.DataFrame(
         trades,
         columns=[
