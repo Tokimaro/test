@@ -16,7 +16,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-TAKER_FEE = 0.00055
+TAKER_FEE = 0.00055  # Bybit USDT-перпетуалы, не-VIP taker (maker 0.02%)
+SPOT_FEE = 0.001  # Bybit спот, не-VIP: 0.1% и для maker, и для taker
 SLIPPAGE = 0.0005
 FUNDING_8H = 0.0001  # базовая ставка Bybit/Binance: 0.01% за 8 часов
 
@@ -26,6 +27,10 @@ class CostModel:
     per_side: float = TAKER_FEE + SLIPPAGE
     funding_8h: float = FUNDING_8H
     perpetual: bool = True  # False — спот (без funding, без шортов)
+
+    @classmethod
+    def spot(cls) -> "CostModel":
+        return cls(per_side=SPOT_FEE + SLIPPAGE, funding_8h=0.0, perpetual=False)
 
 
 @dataclass

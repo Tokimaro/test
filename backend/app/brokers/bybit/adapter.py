@@ -142,7 +142,12 @@ class BybitAdapter(BrokerAdapter):
         return inst
 
     async def _fee_rates(self, symbol: str) -> tuple[Decimal, Decimal]:
-        default = (Decimal("0.00055"), Decimal("0.0002"))
+        # базовые ставки Bybit (не-VIP): деривативы — taker 0.055% / maker 0.02%,
+        # спот — 0.1% / 0.1%; фактические ставки аккаунта берутся из /v5/account/fee-rate
+        if self._category == "spot":
+            default = (Decimal("0.001"), Decimal("0.001"))
+        else:
+            default = (Decimal("0.00055"), Decimal("0.0002"))
         if not self._client.has_credentials:
             return default
         try:

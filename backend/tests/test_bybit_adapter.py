@@ -89,7 +89,8 @@ async def test_instrument_spot_uses_base_precision_and_default_fees() -> None:
     assert inst.qty_step == Decimal("0.0001")
     assert inst.min_notional == Decimal(1)
     assert inst.max_leverage == Decimal(1)
-    assert inst.taker_fee == Decimal("0.00055")
+    assert inst.taker_fee == Decimal("0.001")  # базовая ставка спота Bybit
+    assert inst.maker_fee == Decimal("0.001")
     await a.aclose()
 
 

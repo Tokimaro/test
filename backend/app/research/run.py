@@ -4,8 +4,8 @@
 * параметры стратегий — из литературы, без подбора по результату;
 * in-sample 2018–2021 — только для ознакомления, оценка — out-of-sample 2022-01 → конец данных;
 * ML: walk-forward, переобучение каждые 90 дней только на прошлом, прогнозы — вне обучения;
-* издержки: комиссия taker 0.055% + проскальзывание 0.05% на оборот, funding 0.01%/8ч
-  для перпетуалов (лонги платят, шорты получают); стратегии «только лонг» — спот.
+* издержки Bybit (не-VIP) + проскальзывание 0.05% на оборот: перпетуалы — taker 0.055%,
+  funding 0.01%/8ч (лонги платят, шорты получают); спот — 0.1%. Стратегии «только лонг» — спот.
 
     uv run --extra research python -m app.research.run --data ../data/binance
 """
@@ -34,13 +34,15 @@ def ms(t: pd.Timestamp) -> int:
     return int(t.timestamp() * 1000)
 
 
-def evaluate(res: Result) -> dict[str, Any]:
+def evaluate(
+    res: Result, is_start: pd.Timestamp = IS_START, oos_start: pd.Timestamp = OOS_START
+) -> dict[str, Any]:
     idx = res.returns.index
-    is_mask = (idx >= ms(IS_START)) & (idx < ms(OOS_START))
-    oos_mask = idx >= ms(OOS_START)
+    is_mask = (idx >= ms(is_start)) & (idx < ms(oos_start))
+    oos_mask = idx >= ms(oos_start)
     out: dict[str, Any] = {
-        "in_sample_2018_2021": metrics(res.returns[is_mask], res.bars_per_year, res.turnover),
-        "out_of_sample_2022_2026": {
+        "in_sample": metrics(res.returns[is_mask], res.bars_per_year, res.turnover),
+        "out_of_sample": {
             **metrics(res.returns[oos_mask], res.bars_per_year, res.turnover),
             "sharpe_ci95": sharpe_ci(res.returns[oos_mask], res.bars_per_year),
             "gross_sharpe": metrics(res.gross[oos_mask], res.bars_per_year).get("sharpe"),
@@ -55,13 +57,26 @@ def evaluate(res: Result) -> dict[str, Any]:
     return out
 
 
-def run(data: Path, retrain_days: int) -> dict[str, Any]:
-    symbols = available_symbols(data, Timeframe.D1)
-    daily = {s: load_candles(data, s, Timeframe.D1) for s in symbols}
+def run(
+    data: Path,
+    retrain_days: int,
+    symbols: list[str] | None = None,
+    is_start: pd.Timestamp = IS_START,
+    oos_start: pd.Timestamp = OOS_START,
+    ml_first_test: pd.Timestamp = ML_FIRST_TEST,
+) -> dict[str, Any]:
+    """symbols — торгуемые монеты; BTCUSDT подгружается всегда (рыночный ориентир и фильтр)."""
+    tradable = symbols or available_symbols(data, Timeframe.D1)
+    loaded = tradable if "BTCUSDT" in tradable else [*tradable, "BTCUSDT"]
+    daily = {s: load_candles(data, s, Timeframe.D1) for s in loaded}
     closes = pd.DataFrame({s: d["close"] for s, d in daily.items()}).sort_index()
+    trade = closes[tradable]
     bpy = 365.0
-    spot = CostModel(perpetual=False)
+    spot = CostModel.spot()
     perp = CostModel()
+
+    def wide(w: pd.DataFrame) -> pd.DataFrame:
+        return w.reindex(columns=closes.columns, fill_value=0.0)
 
     results: list[Result] = [
         run_weights(
@@ -72,8 +87,8 @@ def run(data: Path, retrain_days: int) -> dict[str, Any]:
             spot,
         ),
         run_weights(
-            "Бенчмарк: корзина 10 монет",
-            st.hold_every(st.buy_and_hold(closes), 30),
+            f"Бенчмарк: корзина {len(tradable)} монет",
+            wide(st.hold_every(st.buy_and_hold(trade), 30)),
             closes,
             bpy,
             spot,
@@ -83,27 +98,29 @@ def run(data: Path, retrain_days: int) -> dict[str, Any]:
         ),
         run_weights(
             "Тренд (TSMOM), только лонг, спот",
-            st.tsmom(closes, bpy, long_only=True),
+            wide(st.tsmom(trade, bpy, long_only=True)),
             closes,
             bpy,
             spot,
         ),
-        run_weights("Тренд (TSMOM), лонг/шорт", st.tsmom(closes, bpy), closes, bpy, perp),
+        run_weights("Тренд (TSMOM), лонг/шорт", wide(st.tsmom(trade, bpy)), closes, bpy, perp),
         run_weights(
             "Кросс-секционный моментум 4 недели",
-            st.xs_momentum(closes, bpy, vol_managed=False),
+            wide(st.xs_momentum(trade, bpy, vol_managed=False)),
             closes,
             bpy,
             perp,
         ),
         run_weights(
             "Кросс-секционный моментум + упр. волатильностью",
-            st.xs_momentum(closes, bpy),
+            wide(st.xs_momentum(trade, bpy)),
             closes,
             bpy,
             perp,
         ),
-        run_weights("Краткосрочный разворот (1 день)", st.st_reversal(closes), closes, bpy, perp),
+        run_weights(
+            "Краткосрочный разворот (1 день)", wide(st.st_reversal(trade)), closes, bpy, perp
+        ),
     ]
 
     panel = ml.build_panel(daily)
@@ -113,22 +130,23 @@ def run(data: Path, retrain_days: int) -> dict[str, Any]:
         ("LightGBM", ml.lgbm_model),
         ("Нейросеть MLP", ml.mlp_model),
     ):
-        pred = ml.walk_forward_predict(panel, model, name, ms(ML_FIRST_TEST), retrain_days)
-        oos = ml.Prediction(name, pred.frame[pred.frame["ts"] >= ms(OOS_START)])
+        pred = ml.walk_forward_predict(panel, model, name, ms(ml_first_test), retrain_days)
+        oos = ml.Prediction(name, pred.frame[pred.frame["ts"] >= ms(oos_start)])
         ml_quality[name] = ml.information_coefficient(oos)
         for smooth, suffix in ((1, "ежедневно"), (5, "сглаженный прогноз")):
-            w = ml.prediction_weights(pred, closes.index, closes.columns, smooth=smooth)
+            w = wide(ml.prediction_weights(pred, closes.index, trade.columns, smooth=smooth))
             res = run_weights(f"ML {name}: лонг/шорт, {suffix}", w, closes, bpy, perp)
             res.meta["ml_quality_oos"] = ml_quality[name]
             results.append(res)
 
     return {
-        "symbols": symbols,
+        "symbols": tradable,
         "period": [
             str(pd.to_datetime(closes.index[0], unit="ms").date()),
             str(pd.to_datetime(closes.index[-1], unit="ms").date()),
         ],
-        "strategies": {r.name: evaluate(r) for r in results},
+        "in_sample_period": [str(is_start.date()), str(oos_start.date())],
+        "strategies": {r.name: evaluate(r, is_start, oos_start) for r in results},
         "ml_quality_oos": ml_quality,
     }
 
@@ -138,8 +156,19 @@ def main() -> None:
     p.add_argument("--data", required=True)
     p.add_argument("--retrain-days", type=int, default=90)
     p.add_argument("--out", help="сохранить отчёт в JSON")
+    p.add_argument("--symbols", nargs="*", help="монеты (по умолчанию — все в датасете)")
+    p.add_argument("--is-start", default=str(IS_START.date()))
+    p.add_argument("--oos-start", default=str(OOS_START.date()))
+    p.add_argument("--ml-first-test", default=str(ML_FIRST_TEST.date()))
     args = p.parse_args()
-    report = run(Path(args.data), args.retrain_days)
+    report = run(
+        Path(args.data),
+        args.retrain_days,
+        args.symbols,
+        pd.Timestamp(args.is_start, tz="UTC"),
+        pd.Timestamp(args.oos_start, tz="UTC"),
+        pd.Timestamp(args.ml_first_test, tz="UTC"),
+    )
     text = json.dumps(report, ensure_ascii=False, indent=1, default=str)
     if args.out:
         Path(args.out).write_text(text)

@@ -112,13 +112,21 @@ class Costs:
     maker: float
 
 
-_TAKER_FEE = 0.00055 + 0.0002  # Bybit taker 0.055% + проскальзывание 0.02% (ликвидные пары)
-_MAKER_FEE = 0.0002  # Bybit maker 0.02%, без проскальзывания
-TAKER = Costs(_TAKER_FEE, _TAKER_FEE)  # всё рыночными ордерами
-MIXED = Costs(
-    _TAKER_FEE, _MAKER_FEE
-)  # лимитный вход и тейк — maker, стоп и выход по времени — taker
-MAKER = Costs(_MAKER_FEE, _MAKER_FEE)  # оптимистично: всё по maker
+TAKER_FEE = 0.00055  # Bybit USDT-перпетуалы, не-VIP: taker 0.055%
+MAKER_FEE = 0.0002  # maker 0.02%
+SLIPPAGE = 0.0002  # проскальзывание рыночного ордера/стопа на ликвидных парах
+
+
+def cost_models(slippage: float = SLIPPAGE) -> dict[str, "Costs"]:
+    """taker — всё рыночными ордерами; mixed — лимитный вход и тейк по maker без
+    проскальзывания, рыночный вход, стоп и выход по времени — taker + проскальзывание."""
+    taker = TAKER_FEE + slippage
+    return {"taker": Costs(taker, taker), "mixed": Costs(taker, MAKER_FEE)}
+
+
+TAKER = cost_models()["taker"]
+MIXED = cost_models()["mixed"]
+MAKER = Costs(MAKER_FEE, MAKER_FEE)  # оптимистично: всё по maker
 FREE = Costs(0.0, 0.0)
 
 
