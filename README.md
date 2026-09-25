@@ -26,6 +26,9 @@
 
 ## Быстрый старт (Docker)
 
+Развёртывание на сервере с нуля (требования к серверу, безопасность, этапы paper → testnet →
+live, бэкапы, обновления): [docs/deployment.md](docs/deployment.md).
+
 ```bash
 cp .env.example .env
 # заполните: POSTGRES_PASSWORD, TB_JWT_SECRET (openssl rand -hex 32), TB_MASTER_KEY
