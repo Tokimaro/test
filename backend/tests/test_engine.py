@@ -240,6 +240,56 @@ async def test_restart_restores_holdings_without_rebuying(
     assert len(await orders(again)) == n
 
 
+async def test_restart_restores_prices_for_manual_rebalance(
+    env: Env, db_sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    await close_day(env)
+    await env.engine.close_manually("BTCUSDT")
+    # после рестарта новых свечей нет: цены берутся из сохранённых дневных свечей
+    again = await build(db_sessionmaker, env=env)
+    assert set(again.engine.prices) == set(SYMS)
+    results = await again.engine.rebalance_now()
+    assert isinstance(results["crypto"], int) and results["crypto"] > 0
+    assert "BTCUSDT" in again.engine.holdings
+
+
+async def test_symbol_list_change_recomputes_targets(
+    env: Env, db_sessionmaker: async_sessionmaker[AsyncSession]
+) -> None:
+    await close_day(env)
+    n = len(await orders(env))
+    closes = series(0.004, 4)
+    await env.store.save_candles(
+        "XRPUSDT",
+        Timeframe.D1,
+        [Candle(DAY0 + i * DAY_MS, c, c, c, c, 1.0) for i, c in enumerate(closes)],
+    )
+    async with db_sessionmaker() as ses, ses.begin():
+        env.ids["XRPUSDT"] = await upsert_instrument(
+            ses, "paper", await env.paper.get_instrument("XRPUSDT")
+        )
+    cfg = TradingConfig.from_dict(
+        {
+            "markets": {
+                "crypto": {
+                    "market_type": "crypto",
+                    "category": "spot",
+                    "symbols": [*SYMS, "XRPUSDT"],
+                }
+            },
+            "risk": {},
+        }
+    )
+    again = await build(db_sessionmaker, cfg, env=env)
+    assert "XRPUSDT" in again.engine.prices
+    # доли по старому списку не годятся: пока не пересчитаны — ручная ребалансировка ждёт
+    assert await again.engine.rebalance_now() == {"crypto": "targets_pending"}
+    again.clock.now += 20 * 60_000
+    await again.engine.reconcile()  # догоняющий расчёт по новому списку, без сделок
+    assert again.engine.targets["XRPUSDT"] > 0
+    assert len(await orders(again)) == n
+
+
 async def test_kill_switch_sells_everything(env: Env) -> None:
     await close_day(env)
     await env.engine.kill_switch()

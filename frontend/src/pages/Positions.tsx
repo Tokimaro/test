@@ -8,6 +8,25 @@ import type { Holding } from "../lib/types";
 import { useApi } from "../lib/useApi";
 import { useEvents } from "../lib/useEvents";
 
+const SKIP_TEXT: Record<string, string> = {
+  targets_pending: "доли по новому списку монет ещё не рассчитаны — дождитесь дневного расчёта или перезапустите бота",
+  paused: "торговля на паузе",
+  halted: "торговля остановлена (kill switch или просадка) — возобновите её",
+  broker_error: "ошибка биржи, подробности в журнале",
+};
+
+function rebalanceText(results: Record<string, number | string>): string {
+  return Object.values(results)
+    .map((r) =>
+      typeof r === "number"
+        ? r > 0
+          ? `отправлено ордеров: ${r}`
+          : "портфель уже соответствует долям (изменения меньше порога) — сделок нет"
+        : SKIP_TEXT[r] ?? r,
+    )
+    .join("; ");
+}
+
 /** Текущая доля монеты против целевой. */
 function WeightBar({ current, target }: { current: number | null; target: number }) {
   const max = Math.max(0.25, current ?? 0, target);
@@ -25,6 +44,7 @@ function WeightBar({ current, target }: { current: number | null; target: number
 export default function Positions() {
   const { data, error, refresh } = useApi<Holding[]>("/positions", 15_000);
   const [open, setOpen] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   useEvents((e) => {
     if (e.type.startsWith("trade_") || e.type === "rebalance" || e.type === "signal") void refresh();
   });
@@ -40,7 +60,15 @@ export default function Positions() {
             label="Ребалансировать сейчас"
             variant="default"
             confirmText="Привести портфель к последним рассчитанным долям по рынку?"
-            onConfirm={async () => { await post("/control/rebalance"); await refresh(); }}
+            onConfirm={async () => {
+              try {
+                const r = await post<{ results: Record<string, number | string> }>("/control/rebalance");
+                setNote(`Ребалансировка: ${rebalanceText(r.results)}`);
+              } catch (e) {
+                setNote(`Ребалансировка не выполнена: ${e instanceof Error ? e.message : String(e)}`);
+              }
+              await refresh();
+            }}
           />
         </div>
       }
@@ -49,6 +77,7 @@ export default function Positions() {
         Стратегия держит монеты в растущем тренде и продаёт их, когда тренд пропадает. Доли пересчитываются каждый
         день по закрытию дневной свечи, сделки — раз в неделю. Стоп-лоссов нет: выход — по сигналу тренда.
       </p>
+      {note && <p className="mb-3 rounded border border-line bg-surface-2 px-3 py-2 text-sm">{note}</p>}
       <ErrorBox error={error} />
       {data && data.length === 0 && <p className="text-sm text-muted">Движок не запущен</p>}
       {data && data.length > 0 && (

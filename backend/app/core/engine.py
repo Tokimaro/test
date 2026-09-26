@@ -120,6 +120,18 @@ class TradingEngine:
         self.last_rebalance = {k: int(v) for k, v in saved.get("last_rebalance", {}).items()}
         self.targets = {k: float(v) for k, v in saved.get("targets", {}).items()}
         self.paused = bool(saved.get("paused", False))
+        for name, market in self.markets.items():
+            prev = saved.get("symbols", {}).get(name)
+            changed = (
+                prev != market.symbols
+                if prev is not None
+                else bool(self.targets) and any(s not in self.targets for s in market.symbols)
+            )
+            if changed:
+                # список монет изменился: доли считались по старому списку — пересчитать
+                # (сделок это не вызывает, они — по расписанию или вручную)
+                self.last_eval.pop(name, None)
+        await self._load_prices()
         for row in await self.repo.open_trades():
             symbol = self._symbol_of(row)
             if symbol is None or symbol not in self.symbol_market:
@@ -128,6 +140,16 @@ class TradingEngine:
             self.holdings[symbol] = _holding_from_row(row, self.symbol_market[symbol])
         await self.reconcile()
         self.bus.publish("bot_status", **self.status())
+
+    async def _load_prices(self) -> None:
+        """Последние цены — из сохранённых дневных свечей: после рестарта новых свечей по монете
+        может не прийти до следующего дня, а без цены её нельзя ни оценить, ни торговать."""
+        for symbol, name in self.symbol_market.items():
+            if symbol in self.prices:
+                continue
+            candles = await self.store.get_candles(symbol, TF, limit=1)
+            if candles:
+                self._mark(name, symbol, candles[-1])
 
     def status(self) -> dict[str, Any]:
         return {
@@ -276,11 +298,12 @@ class TradingEngine:
         await self._save_state()
 
     # ------------------------------------------------------------------ ребалансировка
-    async def _rebalance(self, market_name: str, day: int, reason: str) -> None:
+    async def _rebalance(self, market_name: str, day: int, reason: str) -> int | str:
+        """Число отправленных ордеров или причина, по которой ребалансировка не выполнена."""
         if self.paused or self.risk.state.halted:
             log.info("engine.rebalance_skipped", market=market_name, paused=self.paused)
             self.bus.publish("rebalance", market=market_name, skipped=True, reason="paused")
-            return
+            return "halted" if self.risk.state.halted else "paused"
         market = self.markets[market_name]
         broker = self.brokers[market_name]
         try:
@@ -289,7 +312,7 @@ class TradingEngine:
         except BrokerError as exc:
             log.error("engine.rebalance_failed", market=market_name, error=str(exc))
             self._api_error("rebalance_failed", market=market_name)
-            return
+            return "broker_error"
         # капитал и текущие доли — только по монетам, которые ведёт бот; чужие монеты на счёте
         # не учитываются и не продаются
         held_qty = {s: wallet.get(s, 0.0) if s in self.holdings else 0.0 for s in market.symbols}
@@ -335,6 +358,7 @@ class TradingEngine:
         self.last_rebalance[market_name] = day
         self.bus.publish("rebalance", market=market_name, reason=reason, orders=orders)
         log.info("engine.rebalanced", market=market_name, orders=len(orders))
+        return len(orders)
 
     async def _buy(
         self, market_name: str, symbol: str, qty: float, tag: str, orders: list[dict[str, Any]]
@@ -620,6 +644,7 @@ class TradingEngine:
                 "last_rebalance": self.last_rebalance,
                 "targets": self.targets,
                 "paused": self.paused,
+                "symbols": {n: list(m.symbols) for n, m in self.markets.items()},
             },
         )
 
@@ -684,14 +709,20 @@ class TradingEngine:
             tag = f"m{self.clock() // 1000 % 10**8}"
             await self._sell(h.market, symbol, None, wallet.get(symbol, 0.0), tag, "manual", [])
 
-    async def rebalance_now(self) -> None:
-        """Внеплановая ребалансировка к последним рассчитанным долям."""
+    async def rebalance_now(self) -> dict[str, int | str]:
+        """Внеплановая ребалансировка к последним рассчитанным долям. По каждому рынку —
+        число ордеров или причина пропуска (targets_pending — доли ещё не рассчитаны)."""
         async with self._lock:
+            await self._load_prices()
+            results: dict[str, int | str] = {}
             for name in self.markets:
                 day = self.last_eval.get(name)
-                if day is not None:
-                    await self._rebalance(name, day, "manual")
+                if day is None:
+                    results[name] = "targets_pending"
+                    continue
+                results[name] = await self._rebalance(name, day, "manual")
             await self._save_state()
+            return results
 
 
 def _holding_from_row(row: TradeRow, market: str) -> Holding:

@@ -179,8 +179,8 @@ async def close_position(symbol: str, ctx: Ctx, user: User) -> dict[str, str]:
 async def rebalance(ctx: Ctx, user: User) -> dict[str, Any]:
     """Внеплановая ребалансировка к последним рассчитанным долям."""
     engine = _engine_or_409(ctx)
-    await engine.rebalance_now()
-    return dict(engine.status())
+    results = await engine.rebalance_now()
+    return {**engine.status(), "results": results}
 
 
 # ---------------------------------------------------------------------- сделки
