@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import pytest
+from cryptography.fernet import Fernet
 from pydantic import SecretStr, ValidationError
 
 from app.config import BACKEND_DIR, RunMode, Settings
@@ -98,6 +99,17 @@ def test_live_mode_guards() -> None:
         jwt_secret=SecretStr("j" * 32),
     )
     assert ok.mode is RunMode.LIVE
+
+
+def test_master_key_validated() -> None:
+    key = Fernet.generate_key().decode()
+    assert Settings(_env_file=None, master_key=SecretStr(key)).master_key.get_secret_value() == key
+    # кавычки, пробелы и \r из Windows-файла убираются
+    messy = Settings(_env_file=None, master_key=SecretStr(f' "{key}"\r'))
+    assert messy.master_key.get_secret_value() == key
+    assert Settings(_env_file=None).master_key.get_secret_value() == ""
+    with pytest.raises(ValidationError, match="TB_MASTER_KEY"):
+        Settings(_env_file=None, master_key=SecretStr(key[:-3]))
 
 
 def test_timeframe_seconds() -> None:

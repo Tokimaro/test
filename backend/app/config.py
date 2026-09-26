@@ -8,7 +8,8 @@ from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr, model_validator
+from cryptography.fernet import Fernet
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -62,6 +63,23 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     # В групповом чате команды принимаются только от этих пользователей (id из Telegram)
     telegram_admin_ids: list[int] = []
+
+    @field_validator("master_key")
+    @classmethod
+    def _valid_master_key(cls, v: SecretStr) -> SecretStr:
+        # пробелы, \r из Windows-переводов строк и кавычки вокруг — частые ошибки копирования
+        key = v.get_secret_value().strip().strip("'\"")
+        if not key:
+            return SecretStr("")
+        try:
+            Fernet(key.encode())
+        except ValueError:
+            raise ValueError(
+                f"TB_MASTER_KEY не является ключом Fernet (длина {len(key)}, нужно 44 символа "
+                "с '=' в конце). Сгенерируйте новый: python -c \"from cryptography.fernet "
+                'import Fernet; print(Fernet.generate_key().decode())"'
+            ) from None
+        return SecretStr(key)
 
     @model_validator(mode="after")
     def _live_requires_mainnet_keys(self) -> "Settings":
