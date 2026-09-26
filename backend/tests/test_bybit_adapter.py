@@ -89,7 +89,8 @@ async def test_instrument_spot_uses_base_precision_and_default_fees() -> None:
     assert inst.qty_step == Decimal("0.0001")
     assert inst.min_notional == Decimal(1)
     assert inst.max_leverage == Decimal(1)
-    assert inst.taker_fee == Decimal("0.00055")
+    assert inst.taker_fee == Decimal("0.001")  # базовая ставка спота Bybit
+    assert inst.maker_fee == Decimal("0.001")
     await a.aclose()
 
 
@@ -225,12 +226,103 @@ async def test_limit_order_requires_price() -> None:
     await a.aclose()
 
 
-async def test_spot_trading_not_supported_yet() -> None:
+@respx.mock
+async def test_spot_market_order_in_base_coin() -> None:
+    route = respx.post(f"{BASE}/v5/order/create").mock(
+        return_value=ok({"orderId": "1", "orderLinkId": "tb1-b"})
+    )
     a = adapter("spot")
-    with pytest.raises(BrokerError, match="spot"):
-        await a.place_order(
-            OrderRequest(symbol="X", direction=Direction.LONG, qty=Decimal(1), link_id="x")
+    res = await a.place_order(
+        OrderRequest(
+            symbol="ETHUSDT", direction=Direction.LONG, qty=Decimal("0.5"), link_id="tb1-b"
         )
+    )
+    body = json.loads(route.calls[0].request.content)
+    assert body["category"] == "spot" and body["side"] == "Buy"
+    assert body["marketUnit"] == "baseCoin"  # иначе qty покупки считался бы в USDT
+    assert "reduceOnly" not in body and "positionIdx" not in body
+    assert res.order_id == "1"
+    with pytest.raises(BrokerError, match="спот"):
+        await a.place_order(
+            OrderRequest(
+                symbol="ETHUSDT",
+                direction=Direction.LONG,
+                qty=Decimal(1),
+                link_id="x",
+                stop_loss=Decimal(1),
+            )
+        )
+    await a.aclose()
+
+
+WALLET = {
+    "list": [
+        {
+            "totalEquity": "12000",
+            "totalAvailableBalance": "11000",
+            "coin": [
+                {"coin": "USDT", "walletBalance": "5000", "locked": "100"},
+                {"coin": "ETH", "walletBalance": "1.2345678"},
+                {"coin": "BTC", "walletBalance": "0"},
+            ],
+        }
+    ]
+}
+
+
+@respx.mock
+async def test_spot_holdings_and_cash() -> None:
+    respx.get(f"{BASE}/v5/account/wallet-balance").mock(return_value=ok(WALLET))
+    a = adapter("spot")
+    (eth,) = await a.get_positions()
+    assert eth.symbol == "ETHUSDT" and eth.qty == Decimal("1.2345678")
+    assert eth.direction is Direction.LONG
+    bal = await a.get_balance()
+    assert bal.equity == Decimal(12000)
+    assert bal.available == Decimal(4900)  # только свободные USDT, а не весь залог счёта
+    assert await a.get_closed_pnl("ETHUSDT", 0) == []
+    await a.aclose()
+
+
+@respx.mock
+async def test_spot_close_rounds_down_to_qty_step() -> None:
+    respx.get(f"{BASE}/v5/account/wallet-balance").mock(return_value=ok(WALLET))
+    respx.get(f"{BASE}/v5/market/instruments-info").mock(
+        return_value=ok(
+            {
+                "list": [
+                    {
+                        "symbol": "ETHUSDT",
+                        "priceFilter": {"tickSize": "0.01"},
+                        "lotSizeFilter": {
+                            "basePrecision": "0.0001",
+                            "minOrderQty": "0.0001",
+                            "maxOrderQty": "1000",
+                            "minOrderAmt": "1",
+                        },
+                    }
+                ]
+            }
+        )
+    )
+    respx.get(f"{BASE}/v5/account/fee-rate").mock(
+        return_value=ok({"list": [{"takerFeeRate": "0.001", "makerFeeRate": "0.001"}]})
+    )
+    route = respx.post(f"{BASE}/v5/order/create").mock(return_value=ok({"orderId": "2"}))
+    a = adapter("spot")
+    await a.close_position("ETHUSDT")
+    body = json.loads(route.calls[0].request.content)
+    assert body["side"] == "Sell" and body["qty"] == "1.2345"
+    await a.aclose()
+
+
+@respx.mock
+async def test_cancel_order_missing_is_false() -> None:
+    respx.post(f"{BASE}/v5/order/cancel").mock(
+        return_value=httpx.Response(200, json={"retCode": 110001, "retMsg": "order not exists"})
+    )
+    a = adapter()
+    assert await a.cancel_order("BTCUSDT", "tb1-entry") is False
     await a.aclose()
 
 

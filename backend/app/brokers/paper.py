@@ -211,6 +211,13 @@ class PaperBroker(BrokerAdapter):
             )
         )
 
+    async def cancel_order(self, symbol: str, link_id: str) -> bool:
+        lim = self.limits.pop(link_id, None)
+        if lim is None:
+            return False
+        self.orders[link_id] = OrderResult(self.orders[link_id].order_id, link_id, "Cancelled")
+        return True
+
     async def cancel_all(self, symbol: str | None = None) -> None:
         for link_id, lim in list(self.limits.items()):
             if symbol is None or lim.symbol == symbol:
@@ -398,6 +405,12 @@ class PaperBroker(BrokerAdapter):
                 for k, v in self.limits.items()
             },
             "order_ids": {k: v.order_id for k, v in self.orders.items()},
+            "order_status": {k: v.status for k, v in self.orders.items()},
+            "order_fills": {
+                k: [str(v.avg_price), str(v.filled_qty)]
+                for k, v in self.orders.items()
+                if v.avg_price is not None
+            },
             "closed": [
                 {
                     "symbol": c.symbol,
@@ -444,8 +457,16 @@ class PaperBroker(BrokerAdapter):
             )
             for k, v in d.get("limits", {}).items()
         }
+        statuses = d.get("order_status", {})
+        fills = d.get("order_fills", {})
         self.orders = {
-            k: OrderResult(oid, k, status="New" if k in self.limits else "Filled")
+            k: OrderResult(
+                oid,
+                k,
+                status="New" if k in self.limits else statuses.get(k, "Filled"),
+                avg_price=Decimal(fills[k][0]) if k in fills else None,
+                filled_qty=Decimal(fills[k][1]) if k in fills else Decimal(0),
+            )
             for k, oid in d.get("order_ids", {}).items()
         }
         self.closed = [

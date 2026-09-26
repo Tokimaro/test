@@ -548,6 +548,18 @@ class AlpacaAdapter(BrokerAdapter):
                 raise BrokerError(f"{symbol}: защитные ордера не отменились за {timeout_s}s")
             await asyncio.sleep(0.25)
 
+    async def cancel_order(self, symbol: str, link_id: str) -> bool:
+        order = await self._t.request(
+            "GET",
+            "/v2/orders:by_client_order_id",
+            params={"client_order_id": link_id},
+            allow_404=True,
+        )
+        if not order or order.get("status") in ("filled", "canceled", "expired", "rejected"):
+            return False
+        await self._t.request("DELETE", f"/v2/orders/{order['id']}", allow_404=True)
+        return True
+
     async def cancel_all(self, symbol: str | None = None) -> None:
         if symbol is None:
             await self._t.request("DELETE", "/v2/orders")

@@ -3,9 +3,11 @@ export interface EngineStatus {
   halted: boolean;
   halt_reason: string | null;
   open_positions: number;
-  risk_pct: number;
   drawdown_pct: number;
   circuit_breaker: boolean;
+  last_rebalance_ts: number | null;
+  next_rebalance_ts: number;
+  target_vol_pct: number;
 }
 
 export interface Status {
@@ -15,69 +17,59 @@ export interface Status {
   engine: EngineStatus | null;
   equity: number | null;
   unrealized: number | null;
-  open_risk: number | null;
+  invested: number | null;
   equity_ts: number | null;
-  day_pnl_pct: number | null;
-  week_pnl_pct: number | null;
   drawdown_pct: number | null;
   markets: Record<string, { symbols: string[]; enabled: boolean; type: string }>;
 }
 
-export interface OpenPosition {
-  trade_id: number;
+/** Монета стратегии: текущее владение и целевая доля. */
+export interface Holding {
   symbol: string;
-  direction: "long" | "short";
-  strategy: string;
-  entry: number;
+  trade_id: number | null;
   qty: number;
-  remaining: number;
-  stop: number;
-  stop_kind: string;
-  tp1: number | null;
-  tp1_done: boolean;
-  tp2: number;
-  confidence: number;
-  regime: string;
-  opened_ts: number;
-  bars_held: number;
+  entry: number | null;
+  price: number | null;
+  value: number;
+  weight: number | null;
+  target_weight: number;
+  score: number | null;
   unrealized: number | null;
-  unrealized_r: number | null;
-  confirmed: boolean;
+  unrealized_pct: number | null;
+  realized: number | null;
+  opened_ts: number | null;
+  components: Record<string, unknown>;
+  next_rebalance_ts: number;
 }
 
+/** Владение монетой: от первой покупки до полной продажи. */
 export interface Trade {
   id: number;
   symbol: string;
   direction: "long" | "short";
   strategy: string;
   status: string;
-  regime: string | null;
-  confidence: number;
   entry: number | null;
   exit: number | null;
   qty: number;
-  initial_stop: number;
-  stop: number;
-  tp1: number | null;
-  tp2: number | null;
-  tp1_done: boolean;
-  risk_amount: number;
+  invested: number | null;
+  return_pct: number | null;
+  target_weight: number | null;
   pnl: number | null;
-  r_multiple: number | null;
   close_reason: string | null;
   bars_held: number;
   opened_ts: number | null;
   closed_ts: number | null;
-  leverage: string | null;
 }
 
 export interface SignalRow {
   id: number;
   ts: number;
   symbol: string;
-  direction: "long" | "short" | null;
-  confidence: number;
-  regime: string;
+  direction: "long" | null;
+  weight_pct: number;
+  score: number | null;
+  rebalance: boolean;
   acted: boolean;
   reject_reason: string | null;
   components: Record<string, unknown>;
@@ -110,30 +102,27 @@ export interface GroupStats {
   trades: number;
   win_rate?: number;
   profit_factor?: number | null;
-  expectancy_r?: number;
+  avg_return_pct?: number;
+  avg_win_return_pct?: number;
+  avg_loss_return_pct?: number;
+  best_return_pct?: number;
+  worst_return_pct?: number;
   net_pnl?: number;
-  avg_r_win?: number;
-  avg_r_loss?: number;
+  fees?: number;
+  avg_days_held?: number;
   max_drawdown_pct?: number;
   sharpe?: number;
   sortino?: number;
   calmar?: number | null;
   total_return_pct?: number;
-  fees?: number;
-  best_r?: number;
-  worst_r?: number;
-  avg_bars_held?: number;
+  cagr_pct?: number;
 }
 
 export interface Stats {
   summary: GroupStats;
-  by_strategy: Record<string, GroupStats>;
   by_symbol: Record<string, GroupStats>;
-  by_regime: Record<string, GroupStats>;
   by_close_reason: Record<string, GroupStats>;
-  by_direction: Record<string, GroupStats>;
-  calibration: { bucket: string; trades: number; win_rate: number; expectancy_r: number }[];
-  r_distribution: number[];
+  return_distribution: number[];
   pnl_by_weekday: Record<string, number>;
   pnl_by_hour: Record<string, number>;
 }

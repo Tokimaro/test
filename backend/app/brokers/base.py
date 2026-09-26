@@ -151,6 +151,10 @@ class BrokerAdapter(ABC):
         """Закрывает позицию целиком (qty=None) или частично рыночным reduce-only ордером."""
 
     @abstractmethod
+    async def cancel_order(self, symbol: str, link_id: str) -> bool:
+        """Отменяет ордер по клиентскому id. False — ордера уже нет (исполнен/отменён)."""
+
+    @abstractmethod
     async def cancel_all(self, symbol: str | None = None) -> None: ...
 
     async def aclose(self) -> None:  # noqa: B027 — необязательный хук

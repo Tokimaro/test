@@ -1,0 +1,230 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from app.research import intraday as it
+
+
+def bars(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
+    idx = pd.date_range("2024-01-01", periods=len(rows), freq="1min", tz="UTC")
+    o, h, lo, c = zip(*rows, strict=True)
+    return pd.DataFrame({"open": o, "high": h, "low": lo, "close": c, "volume": 1.0}, index=idx)
+
+
+def random_bars(n: int = 6000, seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    c = 100 * np.exp(np.cumsum(rng.normal(0, 0.002, n)))
+    o = np.r_[c[0], c[:-1]]
+    spread = np.abs(rng.normal(0, 0.001, n)) * c
+    idx = pd.date_range("2024-01-01", periods=n, freq="1min", tz="UTC")
+    return pd.DataFrame(
+        {
+            "open": o,
+            "high": np.maximum(o, c) + spread,
+            "low": np.minimum(o, c) - spread,
+            "close": c,
+            "volume": rng.uniform(1, 2, n),
+        },
+        index=idx,
+    )
+
+
+def sig(**kw: float) -> pd.DataFrame:
+    row = {"i": 0, "dir": 1, "limit": np.nan, "sl": np.nan, "tp": np.nan, "expiry": 0}
+    row.update({"max_bars": 0, **kw})
+    return pd.DataFrame([row], columns=it.SIGNAL_COLUMNS)
+
+
+def test_market_entry_next_open_and_take_profit() -> None:
+    df = bars([(100, 100, 100, 100), (101, 101, 101, 101), (101, 104, 101, 103)])
+    t = it.simulate(df, sig(i=0, sl=99.0, tp=103.0))
+    assert t.loc[0, "entry"] == 101  # открытие следующего бара, а не закрытие сигнального
+    assert t.loc[0, "reason"] == "tp"
+    assert t.loc[0, "gross_r"] == pytest.approx(1.0)
+
+
+def test_both_levels_in_one_bar_counts_as_stop() -> None:
+    df = bars([(100, 100, 100, 100), (100, 100, 100, 100), (100, 105, 95, 100)])
+    t = it.simulate(df, sig(i=0, sl=98.0, tp=102.0))
+    assert t.loc[0, "reason"] == "sl"
+    assert t.loc[0, "gross_r"] == pytest.approx(-1.0)
+
+
+def test_gap_through_stop_exits_at_open() -> None:
+    df = bars([(100, 100, 100, 100), (100, 100, 100, 100), (95, 96, 94, 95)])
+    t = it.simulate(df, sig(i=0, sl=98.0, tp=110.0))
+    assert t.loc[0, "exit"] == 95
+    assert t.loc[0, "gross_r"] == pytest.approx(-2.5)
+
+
+def test_limit_fill_and_no_take_on_fill_bar() -> None:
+    df = bars(
+        [
+            (100, 100, 100, 100),
+            (100, 101, 99.5, 100),  # до лимита 99 не дошли
+            (100, 104, 98.9, 100),  # лимит исполнен, тейк 103 на этом же баре не засчитан
+            (100, 100, 99.5, 100),
+            (100, 103.5, 100, 103),
+        ]
+    )
+    t = it.simulate(df, sig(i=0, limit=99.0, sl=98.0, tp=103.0, expiry=5))
+    assert t.loc[0, "entry"] == 99.0
+    assert t.loc[0, "exit_ts"] == df.index[4]
+    assert t.loc[0, "gross_r"] == pytest.approx(4.0)
+
+
+def test_limit_fill_through_requires_trading_past_limit() -> None:
+    flat, touch, deep = (100, 100, 100, 100), (100, 100, 98.95, 100), (100, 100, 98.8, 100)
+    take = (100, 111, 100, 110)
+    s = sig(i=0, limit=99.0, sl=90.0, tp=110.0, expiry=5)
+    # при касании исполняется на баре 1; с fill_through=0.1% нужна цена ≤ 98.901 — бар 2
+    assert it.simulate(bars([flat, touch, deep, take]), s).loc[0, "bars"] == 3
+    strict = it.simulate(bars([flat, touch, deep, take]), s, fill_through=0.001)
+    assert strict.loc[0, "bars"] == 2 and strict.loc[0, "entry"] == 99.0
+    assert it.simulate(bars([flat, touch, take]), s, fill_through=0.001).empty
+
+
+def test_limit_expires() -> None:
+    df = bars([(100, 100, 100, 100)] * 5)
+    assert it.simulate(df, sig(i=0, limit=99.0, sl=98.0, tp=103.0, expiry=3)).empty
+
+
+def test_short_and_costs_in_r() -> None:
+    df = bars([(100, 100, 100, 100), (100, 100, 100, 100), (100, 100, 96, 97)])
+    t = it.simulate(df, sig(i=0, dir=-1, sl=102.0, tp=96.0))
+    assert t.loc[0, "gross_r"] == pytest.approx(2.0)
+    # 0.1% на сторону при риске 2 пункта: (100 + 96) × 0.001 / 2 = 0.098 R
+    assert it.net_r(t, it.Costs(0.001, 0.001)).iloc[0] == pytest.approx(2.0 - 0.098)
+
+
+def test_mixed_costs_maker_on_limit_entry_and_take() -> None:
+    t = pd.DataFrame(
+        {
+            "entry": [100.0, 100.0],
+            "exit": [102.0, 99.0],
+            "risk": [1.0, 1.0],
+            "gross_r": [2.0, -1.0],
+            "reason": ["tp", "sl"],
+            "limit_entry": [True, False],
+        }
+    )
+    r = it.net_r(t, it.Costs(taker=0.001, maker=0.0001))
+    assert r.iloc[0] == pytest.approx(2.0 - (0.01 + 0.0102))  # оба конца — maker
+    assert r.iloc[1] == pytest.approx(-1.0 - (0.1 + 0.099))  # рыночный вход и стоп — taker
+
+
+def test_one_position_at_a_time_and_time_exit() -> None:
+    df = bars([(100, 100, 100, 100)] * 10)
+    s = pd.concat([sig(i=0, sl=90.0, max_bars=3), sig(i=2, sl=90.0), sig(i=5, sl=90.0, max_bars=2)])
+    t = it.simulate(df, s)
+    assert list(t["reason"]) == ["time", "time"]
+    assert t.loc[0, "bars"] == 3
+
+
+@pytest.mark.parametrize("name", sorted(it.STRATEGIES))
+@pytest.mark.parametrize("tf", ["1m", "5m"])
+def test_strategies_are_causal(name: str, tf: str) -> None:
+    """Сигналы до момента t не меняются, если отрезать данные после t."""
+    df = it.resample(random_bars(), tf)
+    fn = it.STRATEGIES[name]
+    full = fn(df, rr=2.0, use_bias=True)
+    cut = len(df) * 2 // 3
+    part = fn(df.iloc[:cut], rr=2.0, use_bias=True)
+    # последний час среза может отличаться: неполный часовой бар для фильтра тренда
+    limit = cut - int(pd.Timedelta("2h") / it.bar_delta(df))
+    a = full[full["i"] < limit].sort_values(["i", "dir"]).reset_index(drop=True)
+    b = part[part["i"] < limit].sort_values(["i", "dir"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b, check_dtype=False)
+
+
+def test_htf_bias_uses_only_closed_hours() -> None:
+    df = random_bars(600)
+    bias = it.htf_bias(df, n=5)
+    # значение внутри часа H должно совпасть при отрезании данных сразу после текущего бара
+    for i in (300, 359, 360, 421):
+        assert it.htf_bias(df.iloc[: i + 1], n=5).iloc[-1] == bias.iloc[i]
+
+
+@pytest.mark.parametrize("tf", ["1h", "4h"])
+def test_htf_bias_on_higher_working_timeframe_is_causal(tf: str) -> None:
+    df = it.resample(random_bars(20000), tf)
+    bias = it.htf_bias(df, n=5)
+    for i in range(10, len(df), 7):
+        assert it.htf_bias(df.iloc[: i + 1], n=5).iloc[-1] == bias.iloc[i]
+    # значение на баре i известно после его закрытия — это знак close[i] − EMA
+    diff = df["close"] - it.ema(df["close"], 5)
+    assert (np.sign(diff.to_numpy())[20:] == bias.to_numpy()[20:]).all()
+
+
+def test_first_filled_limit_wins_not_earliest_signal() -> None:
+    """Старая лимитка A (глубже) и свежая B: B исполняется раньше — сделка по B, A снимается.
+    Ранняя версия симулятора брала A, «зная», что она дождётся исполнения."""
+    rows = [(100, 100, 100, 100)] * 3 + [
+        (100, 100, 99.4, 99.6),  # 3: касание лимитки B (99.5)
+        (99.6, 99.7, 98.4, 98.6),  # 4: стоп B (98.9) и касание лимитки A (98.5)
+        (98.6, 103, 98.6, 102),  # 5: тейк A был бы здесь
+    ]
+    df = bars(rows)
+    s = pd.concat(
+        [
+            sig(i=1, limit=98.5, sl=97.0, tp=101.0, expiry=10),  # A
+            sig(i=2, limit=99.5, sl=98.9, tp=101.0, expiry=10),  # B
+        ]
+    )
+    t = it.simulate(df, s)
+    assert len(t) == 1
+    assert t.loc[0, "entry"] == 99.5 and t.loc[0, "reason"] == "sl"
+
+
+def _reference(df: pd.DataFrame, s: pd.DataFrame) -> list[tuple[int, float, float]]:
+    """Побарная эталонная симуляция: активные ордера, первая исполнившаяся — вход."""
+    o, h, lo = (df[k].to_numpy() for k in ("open", "high", "low"))
+    by_i: dict[int, list] = {}  # type: ignore[type-arg]
+    for pos_i, r in zip(s["i"].to_numpy(dtype=int), s.itertuples(index=False), strict=True):
+        by_i.setdefault(int(pos_i), []).append(r)
+    active: list = []  # type: ignore[type-arg]
+    pos = None
+    out = []
+    for t in range(len(o)):
+        if pos is not None:
+            d, px, sl, tp, j = pos
+            if t > j:
+                if lo[t] <= sl if d > 0 else h[t] >= sl:
+                    out.append((t, px, sl if (o[t] - sl) * d > 0 else o[t]))
+                    pos = None
+                elif h[t] >= tp if d > 0 else lo[t] <= tp:
+                    out.append((t, px, tp))
+                    pos = None
+        else:
+            active = [a for a in active if t <= a[0] + int(a[1].expiry)]
+            for a in active:
+                r = a[1]
+                if lo[t] <= r.limit if r.dir > 0 else h[t] >= r.limit:
+                    d = int(r.dir)
+                    px = min(o[t], r.limit) if d > 0 else max(o[t], r.limit)
+                    active = []
+                    if (px - r.sl) * d > 0:
+                        pos = (d, px, r.sl, r.tp, t)
+                        if lo[t] <= r.sl if d > 0 else h[t] >= r.sl:
+                            out.append((t, px, r.sl))
+                            pos = None
+                    break
+        if pos is None:
+            active += [(t, r) for r in by_i.get(t, [])]
+    return out
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_simulate_matches_bar_by_bar_reference(seed: int) -> None:
+    df = random_bars(3000, seed)
+    s = it.fvg_retest(df, rr=2.0, use_bias=False, min_gap_atr=0.0)
+    assert len(s) > 100  # много пересекающихся лимиток
+    t = it.simulate(df, s)
+    ref = _reference(df, s)
+    got = [
+        (df.index.get_loc(x), e, ex)
+        for x, e, ex in zip(t["exit_ts"], t["entry"], t["exit"], strict=True)
+    ]
+    assert len(got) == len(ref)
+    for (k1, e1, x1), (k2, e2, x2) in zip(got, ref, strict=True):
+        assert k1 == k2 and e1 == pytest.approx(e2) and x1 == pytest.approx(x2)

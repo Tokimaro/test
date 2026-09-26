@@ -1,48 +1,39 @@
-# Торговая конфигурация по умолчанию (раздел 14 плана).
+# Торговая конфигурация по умолчанию.
 # Режим работы и ключи API задаются переменными окружения TB_* (см. .env.example).
+#
+# Стратегия — дневной тренд «лонг или кэш» на споте: единственная из ~25 проверенных, давшая
+# устойчивый результат вне выборки (docs/research-strategies.md, docs/strategy-selection.md).
+# Внутридневные стратегии (скальпинг, SMC, пробои) после комиссий и честной симуляции
+# преимущества не показали и из бота убраны.
 
 markets:
   crypto:
     enabled: true
     market_type: crypto
-    category: linear
-    symbols: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT]
-    timeframes: {higher: "240", working: "60", entry: "15"}
+    category: spot  # спот Bybit: комиссия 0.1%, без плеча и шортов
+    # Монеты, на которых стратегия проверялась (8 из исследования, доступные на споте Bybit)
+    symbols: [BTCUSDT, ETHUSDT, SOLUSDT, XRPUSDT, DOGEUSDT, ADAUSDT, TRXUSDT, BCHUSDT]
   stocks:
-    # Акции через Alpaca (нужны TB_ALPACA_API_KEY / TB_ALPACA_API_SECRET, есть paper-счёт)
+    # Акции через Alpaca. Стратегия на акциях НЕ проверялась, поэтому рынок выключен
+    # и включить его конфигурация не даст.
     enabled: false
     market_type: stock
     broker: alpaca
     category: stock
     symbols: [AAPL, MSFT, NVDA, AMZN, SPY]
-    timeframes: {higher: "D", working: "60", entry: "15"}
-    allow_short: false
-    gap_risk_pct: 0.005
-    session_buffer_minutes: 15
 
 risk:
-  # conservative | moderate | aggressive | custom
-  # Для не-custom профиля ключевые значения берутся из пресета (раздел 6.2 плана).
+  # conservative (целевая волатильность 15%) | moderate (25%, проверенная) |
+  # aggressive (40%) | custom (target_vol_pct задаётся вручную)
   profile: moderate
-  losing_streak_cut: 3
-  risk_reduction_factor: 0.5
-  scale_by_confidence: false
+  max_weight_pct: 100         # предел доли одной монеты, % капитала
+  max_drawdown_stop_pct: 0    # продать всё и остановиться при такой просадке (0 — выключено)
 
 strategy:
-  weights:
-    trend: {trend: 0.6, mean_reversion: 0.1, breakout: 0.3}
-    range: {trend: 0.1, mean_reversion: 0.6, breakout: 0.3}
-  stops:
-    sl_atr_min: 1.5
-    sl_atr_max: 3.0
-    tp1_r: 1.5
-    tp1_close_pct: 50
-    tp2_r: 3.0
-    trailing_atr: 3.0
-    min_rr: 2.0
-    min_rr_mean_reversion: 1.5
-    time_stop_bars: 24
-  adx_trend: 25
-  adx_range: 20
-  chaos_volatility_percentile: 95
-  volatility_lookback_days: 90
+  name: trend
+  lookbacks: [20, 60, 120]    # горизонты тренда, дней
+  vol_lookback: 30            # окно волатильности, дней
+  rebalance_weekday: 0        # ребалансировка по понедельникам (0 — пн, 6 — вс; UTC)
+  btc_filter: false           # держать монеты только когда BTC выше 200-дневной средней
+  btc_ma_days: 200
+  min_trade_pct: 1.0          # не торговать изменения доли меньше 1% капитала

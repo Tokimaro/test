@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Button, Card, Direction, ErrorBox, inputClass, Table } from "../components/ui";
+import { Button, Card, ErrorBox, inputClass, Table } from "../components/ui";
 import { download } from "../lib/api";
 import { dateTime, num, pnlClass, price, REASONS, signed } from "../lib/format";
 import type { Trade } from "../lib/types";
@@ -9,7 +9,7 @@ import { useApi } from "../lib/useApi";
 const PAGE = 50;
 
 export default function Trades() {
-  const [filters, setFilters] = useState({ status: "", symbol: "", direction: "", strategy: "", result: "" });
+  const [filters, setFilters] = useState({ status: "", symbol: "", result: "" });
   const [page, setPage] = useState(0);
   const query = useMemo(() => {
     const p = new URLSearchParams({ limit: String(PAGE), offset: String(page * PAGE) });
@@ -25,24 +25,19 @@ export default function Trades() {
 
   return (
     <Card
-      title={`История сделок${data ? ` (${data.total})` : ""}`}
+      title={`Владения монетами${data ? ` (${data.total})` : ""}`}
       actions={
         <Button onClick={() => download(`/trades.csv?${new URLSearchParams(Object.entries(filters).filter(([k, v]) => v && ["status", "symbol"].includes(k)))}`, "trades.csv")}>
           ⬇ CSV
         </Button>
       }
     >
-      <div className="mb-3 grid grid-cols-2 gap-2 md:grid-cols-5">
+      <p className="mb-3 text-xs text-muted">Одна строка — владение монетой от первой покупки до полной продажи, включая докупки и частичные продажи на ребалансировках.</p>
+      <div className="mb-3 grid grid-cols-2 gap-2 md:grid-cols-3">
         <select className={inputClass} value={filters.status} onChange={set("status")}>
-          <option value="">Все статусы</option><option value="open">Открытые</option><option value="closed">Закрытые</option><option value="cancelled">Отменённые</option>
+          <option value="">Все</option><option value="open">Держим</option><option value="closed">Проданы</option>
         </select>
-        <input className={inputClass} placeholder="Инструмент" value={filters.symbol} onChange={set("symbol")} />
-        <select className={inputClass} value={filters.direction} onChange={set("direction")}>
-          <option value="">Оба направления</option><option value="long">Long</option><option value="short">Short</option>
-        </select>
-        <select className={inputClass} value={filters.strategy} onChange={set("strategy")}>
-          <option value="">Все стратегии</option><option value="trend">Тренд</option><option value="mean_reversion">Возврат к среднему</option><option value="breakout">Пробой</option>
-        </select>
+        <input className={inputClass} placeholder="Монета" value={filters.symbol} onChange={set("symbol")} />
         <select className={inputClass} value={filters.result} onChange={set("result")}>
           <option value="">Любой результат</option><option value="win">Прибыльные</option><option value="loss">Убыточные</option>
         </select>
@@ -50,21 +45,20 @@ export default function Trades() {
       <ErrorBox error={error} />
       <Table>
         <thead>
-          <tr><th>#</th><th>Инструмент</th><th>Напр.</th><th>Стратегия</th><th>Вход</th><th>Выход</th><th>PnL</th><th>R</th><th>Причина</th><th>Уверен.</th><th>Открыта</th></tr>
+          <tr><th>#</th><th>Монета</th><th>Средняя цена</th><th>Продажа</th><th>Вложено</th><th>Результат</th><th>Доходность</th><th>Причина</th><th>Дней</th><th>С</th></tr>
         </thead>
         <tbody>
           {data?.items.map((t) => (
             <tr key={t.id}>
               <td><Link className="text-accent" to={`/trades/${t.id}`}>{t.id}</Link></td>
               <td className="font-medium">{t.symbol}</td>
-              <td><Direction value={t.direction} /></td>
-              <td>{t.strategy}</td>
               <td>{price(t.entry)}</td>
               <td>{price(t.exit)}</td>
-              <td className={pnlClass(t.pnl)}>{t.status === "closed" ? signed(t.pnl) : t.status}</td>
-              <td className={pnlClass(t.r_multiple)}>{signed(t.r_multiple)}</td>
+              <td>{num(t.invested)}</td>
+              <td className={pnlClass(t.pnl)}>{t.status === "closed" ? signed(t.pnl) : t.status === "open" ? "держим" : t.status}</td>
+              <td className={pnlClass(t.return_pct)}>{signed(t.return_pct, 2, "%")}</td>
               <td>{t.close_reason ? REASONS[t.close_reason] ?? t.close_reason : "—"}</td>
-              <td>{num(t.confidence, 0)}%</td>
+              <td>{t.bars_held || "—"}</td>
               <td className="text-xs">{dateTime(t.opened_ts)}</td>
             </tr>
           ))}

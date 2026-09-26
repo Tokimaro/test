@@ -1,4 +1,4 @@
-"""Метрики результатов торговли (разделы 9.1 и 10 плана)."""
+"""Метрики результатов торговли: кривая капитала и владения монетами."""
 
 import math
 from collections import defaultdict
@@ -10,33 +10,33 @@ import numpy as np
 from app.backtest.engine import BacktestResult, ClosedTrade
 
 YEAR_MS = 365 * 86_400_000
-CONFIDENCE_BUCKETS = [(50, 60), (60, 65), (65, 70), (70, 75), (75, 80), (80, 90), (90, 101)]
 
 
 def trade_stats(trades: Iterable[ClosedTrade]) -> dict[str, Any]:
+    """Статистика владений монетами (от покупки до полной продажи).
+    r_multiple у стратегии тренда — доходность владения (pnl / вложено)."""
     ts = list(trades)
     n = len(ts)
     if n == 0:
         return {"trades": 0}
     pnl = np.array([t.pnl for t in ts])
-    r = np.array([t.r_multiple for t in ts])
+    ret = np.array([t.r_multiple for t in ts]) * 100
     wins, losses = pnl[pnl > 0], pnl[pnl <= 0]
     gross_win, gross_loss = float(wins.sum()), float(-losses.sum())
     return {
         "trades": n,
         "win_rate": round(len(wins) / n * 100, 2),
         "profit_factor": round(gross_win / gross_loss, 3) if gross_loss > 0 else None,
-        "expectancy_r": round(float(r.mean()), 4),
-        "avg_r_win": round(float(r[pnl > 0].mean()), 4) if len(wins) else 0.0,
-        "avg_r_loss": round(float(r[pnl <= 0].mean()), 4) if len(losses) else 0.0,
+        "avg_return_pct": round(float(ret.mean()), 3),
+        "avg_win_return_pct": round(float(ret[pnl > 0].mean()), 3) if len(wins) else 0.0,
+        "avg_loss_return_pct": round(float(ret[pnl <= 0].mean()), 3) if len(losses) else 0.0,
+        "best_return_pct": round(float(ret.max()), 2),
+        "worst_return_pct": round(float(ret.min()), 2),
         "avg_win": round(float(wins.mean()), 2) if len(wins) else 0.0,
         "avg_loss": round(float(losses.mean()), 2) if len(losses) else 0.0,
-        "best_r": round(float(r.max()), 3),
-        "worst_r": round(float(r.min()), 3),
         "net_pnl": round(float(pnl.sum()), 2),
         "fees": round(sum(t.fees for t in ts), 2),
-        "funding": round(sum(t.funding for t in ts), 2),
-        "avg_bars_held": round(sum(t.bars_held for t in ts) / n, 1),
+        "avg_days_held": round(sum(t.bars_held for t in ts) / n, 1),
     }
 
 
@@ -76,25 +76,6 @@ def breakdown(trades: list[ClosedTrade], key: str) -> dict[str, dict[str, Any]]:
     return {k: trade_stats(v) for k, v in sorted(groups.items())}
 
 
-def confidence_calibration(trades: list[ClosedTrade]) -> list[dict[str, Any]]:
-    """Фактический винрейт в корзинах уверенности — можно ли ей доверять."""
-    out = []
-    for lo, hi in CONFIDENCE_BUCKETS:
-        bucket = [t for t in trades if lo <= t.confidence < hi]
-        if not bucket:
-            continue
-        wins = sum(1 for t in bucket if t.pnl > 0)
-        out.append(
-            {
-                "bucket": f"{lo}-{min(hi, 100)}",
-                "trades": len(bucket),
-                "win_rate": round(wins / len(bucket) * 100, 2),
-                "expectancy_r": round(sum(t.r_multiple for t in bucket) / len(bucket), 4),
-            }
-        )
-    return out
-
-
 def summarize(result: BacktestResult) -> dict[str, Any]:
     trades = result.trades
     return {
@@ -102,33 +83,8 @@ def summarize(result: BacktestResult) -> dict[str, Any]:
             **equity_stats(result.equity_curve, result.initial_equity, result.bar_ms),
             **trade_stats(trades),
         },
-        "by_strategy": breakdown(trades, "strategy"),
         "by_symbol": breakdown(trades, "symbol"),
-        "by_regime": breakdown(trades, "regime"),
         "by_close_reason": breakdown(trades, "close_reason"),
-        "by_direction": breakdown(trades, "direction"),
-        "calibration": confidence_calibration(trades),
         "signals": result.signal_stats,
         "risk_events": len(result.risk_events),
-    }
-
-
-def monte_carlo_drawdown(
-    r_multiples: list[float], risk_pct: float, runs: int = 1000, seed: int = 0
-) -> dict[str, float]:
-    """Перемешивание порядка сделок: распределение максимальной просадки (раздел 10.4)."""
-    if not r_multiples:
-        return {}
-    rng = np.random.default_rng(seed)
-    r = np.array(r_multiples)
-    dds = np.empty(runs)
-    for k in range(runs):
-        eq = np.cumprod(1 + rng.permutation(r) * risk_pct / 100)
-        eq = np.concatenate([[1.0], eq])
-        peak = np.maximum.accumulate(eq)
-        dds[k] = ((peak - eq) / peak).max()
-    return {
-        "dd_median_pct": round(float(np.median(dds)) * 100, 2),
-        "dd_p95_pct": round(float(np.percentile(dds, 95)) * 100, 2),
-        "dd_max_pct": round(float(dds.max()) * 100, 2),
     }

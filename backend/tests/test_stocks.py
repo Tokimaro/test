@@ -7,13 +7,12 @@ import httpx
 import pytest
 import respx
 
-from app.backtest.engine import Backtester, BacktestSettings
 from app.brokers.alpaca import AlpacaAdapter, AlpacaClient
 from app.brokers.base import BrokerError, OrderRequest, OrderType
-from app.domain import Direction, Instrument, MarketType, Timeframe
+from app.config import BACKEND_DIR
+from app.domain import Direction, MarketType, Timeframe
 from app.market.sessions import SessionCalendar
-from app.risk.sizing import size_position
-from tests.test_backtest import CONFIG, FLAT, manual_symbol
+from app.trading_config import TradingConfig
 
 T = "https://trade.test"
 D = "https://data.test"
@@ -52,44 +51,6 @@ def test_buffer_and_calendar_holidays() -> None:
     assert cal.is_open(ms(2026, 7, 2, 13, 45), buffer_minutes=15)
     assert not cal.is_open(ms(2026, 7, 2, 19, 50), buffer_minutes=15)
     assert not cal.is_open(ms(2026, 11, 27, 18, 30))  # после 13:00 ET
-
-
-# ------------------------------------------------------------------ риск гэпа и шорт
-def test_gap_risk_reduces_size() -> None:
-    inst = Instrument(
-        "AAPL",
-        MarketType.STOCK,
-        "stock",
-        Decimal("0.01"),
-        Decimal(1),
-        Decimal(1),
-        Decimal(10**6),
-        taker_fee=Decimal(0),
-    )
-    kw: dict[str, Any] = dict(
-        equity=Decimal(10_000),
-        risk_pct=1.0,
-        direction=Direction.LONG,
-        entry=Decimal(200),
-        stop=Decimal(196),
-        instrument=inst,
-        available_margin=Decimal(10_000),
-        max_leverage=Decimal(1),
-        derivatives=False,
-    )
-    plain = size_position(**kw)
-    gapped = size_position(**kw, gap_risk_pct=Decimal("0.005"))
-    assert gapped.qty < plain.qty
-    assert gapped.risk_amount <= Decimal(100)
-    assert gapped.qty == gapped.qty.to_integral_value()
-
-
-def test_backtest_respects_short_ban() -> None:
-    stocks = CONFIG.markets["crypto"].model_copy(update={"allow_short": False})
-    sym = manual_symbol([FLAT, FLAT, FLAT], direction=Direction.SHORT)
-    res = Backtester(CONFIG, stocks, BacktestSettings(slippage_pct=0)).run([sym])
-    assert res.trades == []
-    assert res.signal_stats["reject_short_not_allowed"] == 1
 
 
 # ------------------------------------------------------------------ Alpaca
@@ -539,7 +500,11 @@ async def test_get_order_404_is_none_and_retries_on_429() -> None:
     assert await adapter().get_order("AAPL", "tb9-entry") is None
 
 
-def test_default_config_has_stocks_market() -> None:
-    stocks = CONFIG.markets["stocks"]
-    assert stocks.broker == "alpaca" and not stocks.allow_short
-    assert stocks.timeframes.higher is Timeframe.D1
+def test_stocks_market_is_off_and_cannot_be_enabled() -> None:
+    """Стратегия на акциях не проверялась: рынок выключен, включить его конфигурация не даст."""
+    raw = TradingConfig.load(BACKEND_DIR / "config" / "default.yaml").model_dump(mode="json")
+    stocks = raw["markets"]["stocks"]
+    assert stocks["broker"] == "alpaca" and not stocks["enabled"]
+    stocks["enabled"] = True
+    with pytest.raises(ValueError, match="не проверялся"):
+        TradingConfig.from_dict(raw)

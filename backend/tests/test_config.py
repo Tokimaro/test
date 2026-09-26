@@ -12,59 +12,76 @@ def test_default_config_loads() -> None:
     cfg = TradingConfig.load(BACKEND_DIR / "config" / "default.yaml")
     crypto = cfg.markets["crypto"]
     assert crypto.market_type is MarketType.CRYPTO
-    assert crypto.timeframes.working is Timeframe.H1
+    assert crypto.category == "spot"
+    assert "BTCUSDT" in crypto.symbols
     assert cfg.risk.profile is RiskProfile.MODERATE
-    assert cfg.risk.risk_per_trade_pct == 1.0
-    assert cfg.risk.confidence_threshold == 65.0
+    assert cfg.risk.target_vol_pct == 25.0  # проверенная конфигурация
+    assert cfg.strategy.name == "trend"
+    assert cfg.strategy.lookbacks == (20, 60, 120)
+    assert not cfg.markets["stocks"].enabled
 
 
 def test_preset_overrides_manual_values() -> None:
-    risk = resolve_risk({"profile": "conservative", "risk_per_trade_pct": 2.5})
-    assert risk.risk_per_trade_pct == 0.5
-    assert risk.max_leverage == 3.0
+    risk = resolve_risk({"profile": "conservative", "target_vol_pct": 80})
+    assert risk.target_vol_pct == 15.0
+    assert resolve_risk({"profile": "aggressive"}).target_vol_pct == 40.0
 
 
 def test_custom_profile_keeps_values() -> None:
-    risk = resolve_risk({"profile": "custom", "risk_per_trade_pct": 1.7})
-    assert risk.risk_per_trade_pct == 1.7
+    risk = resolve_risk({"profile": "custom", "target_vol_pct": 33, "max_drawdown_stop_pct": 30})
+    assert risk.target_vol_pct == 33
+    assert risk.max_drawdown_stop_pct == 30
 
 
-@pytest.mark.parametrize("value", [0.0, 0.05, 3.5, -1])
-def test_risk_per_trade_bounds(value: float) -> None:
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("target_vol_pct", 2),
+        ("target_vol_pct", 150),
+        ("max_weight_pct", 0),
+        ("max_drawdown_stop_pct", -1),
+    ],
+)
+def test_risk_bounds(field: str, value: float) -> None:
     with pytest.raises(ValidationError):
-        RiskSettings(profile=RiskProfile.CUSTOM, risk_per_trade_pct=value)
+        RiskSettings(profile=RiskProfile.CUSTOM, **{field: value})
 
 
-def test_risk_consistency() -> None:
-    with pytest.raises(ValidationError):
-        RiskSettings(risk_per_trade_pct=3.0, max_total_open_risk_pct=2.0)
-    with pytest.raises(ValidationError):
-        RiskSettings(daily_loss_limit_pct=8.0, weekly_loss_limit_pct=6.0)
+def _raw(**market: object) -> dict[str, object]:
+    base = {"market_type": "crypto", "category": "spot", "symbols": ["ETHUSDT"]}
+    return {"markets": {"x": {**base, **market}}, "risk": {}}
 
 
-def test_timeframes_must_descend() -> None:
-    raw = {
-        "markets": {
-            "x": {
-                "market_type": "crypto",
-                "category": "linear",
-                "timeframes": {"higher": "15", "working": "60", "entry": "240"},
-            }
-        },
-        "risk": {},
-    }
+def test_only_validated_markets_can_be_enabled() -> None:
+    with pytest.raises(ValidationError, match="проверена только на споте"):
+        TradingConfig.from_dict(_raw(category="linear"))
+    with pytest.raises(ValidationError, match="проверена только на споте"):
+        TradingConfig.from_dict(_raw(market_type="stock", category="stock"))
+    # выключенный непроверенный рынок допустим
+    TradingConfig.from_dict(_raw(category="linear", enabled=False))
+
+
+def test_btc_filter_requires_btc() -> None:
+    raw = _raw()
+    raw["strategy"] = {"btc_filter": True}
+    with pytest.raises(ValidationError, match="BTCUSDT"):
+        TradingConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize("lookbacks", [[], [60, 20], [1, 20], [20, 20], [20, 500]])
+def test_lookbacks_validated(lookbacks: list[int]) -> None:
+    raw = _raw()
+    raw["strategy"] = {"lookbacks": lookbacks}
     with pytest.raises(ValidationError):
         TradingConfig.from_dict(raw)
 
 
-def test_weights_sum_to_one() -> None:
-    raw = {
-        "markets": {},
-        "risk": {},
-        "strategy": {"weights": {"trend": {"trend": 0.5, "mean_reversion": 0.1, "breakout": 0.1}}},
-    }
-    with pytest.raises(ValidationError):
-        TradingConfig.from_dict(raw)
+def test_history_days() -> None:
+    cfg = TradingConfig.from_dict(_raw()).strategy
+    assert cfg.history_days == 121
+    raw = _raw(symbols=["BTCUSDT"])
+    raw["strategy"] = {"btc_filter": True, "btc_ma_days": 200}
+    assert TradingConfig.from_dict(raw).strategy.history_days == 200
 
 
 def test_live_mode_guards() -> None:

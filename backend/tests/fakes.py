@@ -22,8 +22,14 @@ class FakeMarketBroker(BrokerAdapter):
 
     name = "fake"
 
-    def __init__(self, history: dict[tuple[str, Timeframe], list[Candle]] | None = None) -> None:
+    def __init__(
+        self,
+        history: dict[tuple[str, Timeframe], list[Candle]] | None = None,
+        *,
+        spot: bool = False,
+    ) -> None:
         self.history = history or {}
+        self.spot = spot
         self.events: list[StreamEvent] = []
         self.candle_requests: list[tuple[str, Timeframe, int, int]] = []
 
@@ -31,6 +37,19 @@ class FakeMarketBroker(BrokerAdapter):
         return MarketType.CRYPTO
 
     async def get_instrument(self, symbol: str) -> Instrument:
+        if self.spot:  # как спот Bybit: комиссия 0.1%, без плеча
+            return Instrument(
+                symbol=symbol,
+                market_type=MarketType.CRYPTO,
+                category="spot",
+                tick_size=Decimal("0.01"),
+                qty_step=Decimal("0.00001"),
+                min_qty=Decimal("0.00001"),
+                max_qty=Decimal(100_000),
+                min_notional=Decimal(1),
+                taker_fee=Decimal("0.001"),
+                maker_fee=Decimal("0.001"),
+            )
         return Instrument(
             symbol=symbol,
             market_type=MarketType.CRYPTO,
@@ -81,6 +100,9 @@ class FakeMarketBroker(BrokerAdapter):
         raise NotImplementedError
 
     async def close_position(self, symbol: str, qty: Decimal | None = None) -> OrderResult | None:
+        raise NotImplementedError
+
+    async def cancel_order(self, symbol: str, link_id: str) -> bool:
         raise NotImplementedError
 
     async def cancel_all(self, symbol: str | None = None) -> None:

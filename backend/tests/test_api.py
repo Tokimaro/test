@@ -55,26 +55,22 @@ async def seeded(db_sessionmaker: async_sessionmaker[AsyncSession]) -> str:
     async with db_sessionmaker() as s, s.begin():
         iid = await upsert_instrument(s, "bybit", inst)
     repo = TradeRepo(db_sessionmaker, "paper")
-    for pnl, r in ((150.0, 1.5), (-100.0, -1.0)):
+    for pnl, ret in ((150.0, 0.15), (-100.0, -0.1)):
         tid = await repo.create_trade(
             instrument_id=iid,
             strategy="trend",
             direction="long",
             status="closed",
-            qty=Decimal(1),
+            qty=Decimal(10),
             remaining_qty=Decimal(0),
-            initial_stop=Decimal(90),
-            stop_loss=Decimal(90),
-            tp2=Decimal(130),
-            risk_amount=Decimal(100),
-            confidence=72.0,
+            confidence=25.0,
             entry_price=Decimal(100),
-            exit_price=Decimal(100 + pnl / 1),
+            exit_price=Decimal(100 + pnl / 10),
             realized_pnl=Decimal(str(pnl)),
-            r_multiple=r,
-            close_reason="tp2" if pnl > 0 else "sl",
+            r_multiple=ret,
+            close_reason="schedule" if pnl > 0 else "manual",
             closed_at=datetime.now(UTC),
-            extra={"regime": "trend_up"},
+            extra={"invested": 1000.0, "return_pct": ret * 100},
         )
         assert tid > 0
     return secret
@@ -131,7 +127,8 @@ def test_trades_stats_and_csv(client: TestClient, seeded: str) -> None:
     h = login(client, seeded)
     body = client.get("/api/trades", headers=h).json()
     assert body["total"] == 2
-    assert {t["close_reason"] for t in body["items"]} == {"tp2", "sl"}
+    assert {t["close_reason"] for t in body["items"]} == {"schedule", "manual"}
+    assert {t["return_pct"] for t in body["items"]} == {15.0, -10.0}
     wins = client.get("/api/trades", params={"result": "win"}, headers=h).json()
     assert wins["total"] == 1
     detail = client.get(f"/api/trades/{body['items'][0]['id']}", headers=h).json()
@@ -142,8 +139,9 @@ def test_trades_stats_and_csv(client: TestClient, seeded: str) -> None:
     s = stats["summary"]
     assert s["trades"] == 2 and s["win_rate"] == 50.0
     assert s["profit_factor"] == 1.5
-    assert s["expectancy_r"] == 0.25
-    assert stats["by_regime"]["trend_up"]["trades"] == 2
+    assert s["avg_return_pct"] == 2.5
+    assert stats["by_symbol"]["BTCUSDT"]["trades"] == 2
+    assert stats["return_distribution"] == [15.0, -10.0]
 
     csv_resp = client.get("/api/trades.csv", headers=h)
     assert csv_resp.status_code == 200
@@ -153,14 +151,19 @@ def test_trades_stats_and_csv(client: TestClient, seeded: str) -> None:
 def test_settings_validation_and_history(client: TestClient, seeded: str, migrated_db: str) -> None:
     h = login(client, seeded)
     cfg = client.get("/api/settings", headers=h).json()
-    bad = {**cfg, "risk": {**cfg["risk"], "profile": "custom", "risk_per_trade_pct": 50}}
+    bad = {**cfg, "risk": {**cfg["risk"], "profile": "custom", "target_vol_pct": 500}}
     assert client.put("/api/settings", json=bad, headers=h).status_code == 422
+    # непроверенный рынок включить нельзя
+    markets = {**cfg["markets"], "stocks": {**cfg["markets"]["stocks"], "enabled": True}}
+    assert (
+        client.put("/api/settings", json={**cfg, "markets": markets}, headers=h).status_code == 422
+    )
 
-    good = {**cfg, "risk": {**cfg["risk"], "profile": "custom", "risk_per_trade_pct": 0.7}}
+    good = {**cfg, "risk": {**cfg["risk"], "profile": "custom", "target_vol_pct": 20}}
     resp = client.put("/api/settings", json=good, headers=h)
     assert resp.status_code == 200
-    assert resp.json()["config"]["risk"]["risk_per_trade_pct"] == 0.7
-    assert client.get("/api/settings", headers=h).json()["risk"]["risk_per_trade_pct"] == 0.7
+    assert resp.json()["config"]["risk"]["target_vol_pct"] == 20
+    assert client.get("/api/settings", headers=h).json()["risk"]["target_vol_pct"] == 20
     history = client.get("/api/settings/history", headers=h).json()
     assert history[0]["updated_by"] == "admin"
 
@@ -168,6 +171,7 @@ def test_settings_validation_and_history(client: TestClient, seeded: str, migrat
 def test_control_without_engine(client: TestClient, seeded: str) -> None:
     h = login(client, seeded)
     assert client.post("/api/control/pause", headers=h).status_code == 409
+    assert client.post("/api/control/rebalance", headers=h).status_code == 409
     assert client.post("/api/control/kill", json={"confirm": "no"}, headers=h).status_code == 400
     assert client.get("/api/positions", headers=h).json() == []
     status = client.get("/api/status", headers=h).json()

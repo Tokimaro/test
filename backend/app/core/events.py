@@ -12,7 +12,8 @@ log = structlog.get_logger()
 
 @dataclass(frozen=True, slots=True)
 class Event:
-    type: str  # signal / trade_opened / trade_updated / trade_closed / equity / alert / bot_status
+    type: str  # signal / entry_placed / entry_expired / trade_opened / trade_updated /
+    # trade_closed / equity / alert / bot_status
     data: dict[str, Any] = field(default_factory=dict)
     ts: int = field(default_factory=lambda: int(time.time() * 1000))
 

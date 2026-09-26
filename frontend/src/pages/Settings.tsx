@@ -6,33 +6,13 @@ import { useApi } from "../lib/useApi";
 type Obj = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
 
 const PROFILES = [
-  ["conservative", "Консервативный (0.5%)"],
-  ["moderate", "Умеренный (1%)"],
-  ["aggressive", "Агрессивный (2%)"],
+  ["conservative", "Консервативный (волатильность 15%)"],
+  ["moderate", "Умеренный (25%, проверенный)"],
+  ["aggressive", "Агрессивный (40%)"],
   ["custom", "Свой"],
 ] as const;
 
-const RISK_FIELDS: [string, string, number, number, number][] = [
-  ["risk_per_trade_pct", "Риск на сделку, %", 0.1, 3, 0.1],
-  ["max_open_positions", "Макс. позиций", 1, 20, 1],
-  ["max_total_open_risk_pct", "Макс. суммарный риск, %", 0.5, 20, 0.5],
-  ["daily_loss_limit_pct", "Дневной лимит убытка, %", 0.5, 20, 0.5],
-  ["weekly_loss_limit_pct", "Недельный лимит убытка, %", 1, 40, 0.5],
-  ["max_drawdown_stop_pct", "Остановка при просадке, %", 2, 50, 1],
-  ["max_leverage", "Макс. плечо", 1, 20, 1],
-  ["confidence_threshold", "Порог уверенности, %", 50, 95, 1],
-];
-
-const STOP_FIELDS: [string, string, number][] = [
-  ["sl_atr_min", "SL мин., ATR", 0.1],
-  ["sl_atr_max", "SL макс., ATR", 0.1],
-  ["tp1_r", "TP1, R", 0.1],
-  ["tp1_close_pct", "Закрыть на TP1, %", 5],
-  ["tp2_r", "TP2, R", 0.1],
-  ["trailing_atr", "Трейлинг, ATR", 0.1],
-  ["min_rr", "Мин. R:R", 0.1],
-  ["time_stop_bars", "Тайм-стоп, свечей", 1],
-];
+const WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"];
 
 export default function SettingsPage() {
   const remote = useApi<Obj>("/settings");
@@ -70,6 +50,10 @@ export default function SettingsPage() {
   return (
     <>
       <Card title="Риск">
+        <p className="mb-3 text-xs text-muted">
+          Размер позиций задаёт целевая волатильность: чем она выше, тем большую долю капитала стратегия держит в
+          монетах (не больше 100% — спот без плеча). В проверке использовалось 25%.
+        </p>
         <div className="mb-4 flex flex-wrap gap-2">
           {PROFILES.map(([id, label]) => (
             <Button key={id} variant={cfg.risk.profile === id ? "primary" : "default"} onClick={() => setPath(["risk", "profile"], id)}>
@@ -77,44 +61,54 @@ export default function SettingsPage() {
             </Button>
           ))}
         </div>
-        {!custom && <p className="mb-3 text-xs text-muted">Значения задаёт выбранный профиль. Чтобы менять их вручную, выберите «Свой».</p>}
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-          {RISK_FIELDS.map(([key, label, min, max, step]) => (
-            <Field key={key} label={label} hint={`${min}…${max}`}>
-              <input className={inputClass} type="number" min={min} max={max} step={step} disabled={!custom}
-                value={cfg.risk[key]} onChange={(e) => setPath(["risk", key], Number(e.target.value))} />
-            </Field>
-          ))}
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+          <Field label="Целевая волатильность, %" hint={custom ? "5…100" : "задаёт профиль"}>
+            <input className={inputClass} type="number" min={5} max={100} step={1} disabled={!custom}
+              value={cfg.risk.target_vol_pct} onChange={(e) => setPath(["risk", "target_vol_pct"], Number(e.target.value))} />
+          </Field>
+          <Field label="Макс. доля одной монеты, %" hint="100 — без ограничения">
+            <input className={inputClass} type="number" min={1} max={100} step={1}
+              value={cfg.risk.max_weight_pct} onChange={(e) => setPath(["risk", "max_weight_pct"], Number(e.target.value))} />
+          </Field>
+          <Field label="Всё в USDT при просадке, %" hint="0 — выключено (в проверке не использовалось)">
+            <input className={inputClass} type="number" min={0} max={90} step={1}
+              value={cfg.risk.max_drawdown_stop_pct} onChange={(e) => setPath(["risk", "max_drawdown_stop_pct"], Number(e.target.value))} />
+          </Field>
+        </div>
+      </Card>
+
+      <Card title="Стратегия: дневной тренд «лонг или кэш»">
+        <p className="mb-3 text-xs text-muted">
+          Значения по умолчанию — проверенная конфигурация (docs/strategy-selection.md). Изменения действуют с ближайшего
+          расчёта; подбор параметров под историю повышает риск переобучения.
+        </p>
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+          <Field label="Горизонты тренда, дней" hint="через пробел, по возрастанию">
+            <input className={inputClass} value={cfg.strategy.lookbacks.join(" ")}
+              onChange={(e) => setPath(["strategy", "lookbacks"], e.target.value.split(/[\s,]+/).filter(Boolean).map(Number))} />
+          </Field>
+          <Field label="Окно волатильности, дней">
+            <input className={inputClass} type="number" min={5} max={365} value={cfg.strategy.vol_lookback}
+              onChange={(e) => setPath(["strategy", "vol_lookback"], Number(e.target.value))} />
+          </Field>
+          <Field label="День ребалансировки (UTC)">
+            <select className={inputClass} value={cfg.strategy.rebalance_weekday}
+              onChange={(e) => setPath(["strategy", "rebalance_weekday"], Number(e.target.value))}>
+              {WEEKDAYS.map((d, i) => <option key={d} value={i}>{d}</option>)}
+            </select>
+          </Field>
+          <Field label="Мин. изменение доли, % капитала" hint="меньшие изменения не торгуются (экономия комиссий)">
+            <input className={inputClass} type="number" min={0} max={20} step={0.5} value={cfg.strategy.min_trade_pct}
+              onChange={(e) => setPath(["strategy", "min_trade_pct"], Number(e.target.value))} />
+          </Field>
           <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={cfg.risk.scale_by_confidence} onChange={(e) => setPath(["risk", "scale_by_confidence"], e.target.checked)} />
-            Масштабировать риск по уверенности
+            <input type="checkbox" checked={cfg.strategy.btc_filter} onChange={(e) => setPath(["strategy", "btc_filter"], e.target.checked)} />
+            Держать монеты только когда BTC выше средней (нужен BTCUSDT в списке)
           </label>
-        </div>
-      </Card>
-
-      <Card title="Стопы и цели">
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-          {STOP_FIELDS.map(([key, label, step]) => (
-            <Field key={key} label={label}>
-              <input className={inputClass} type="number" step={step} value={cfg.strategy.stops[key]}
-                onChange={(e) => setPath(["strategy", "stops", key], Number(e.target.value))} />
-            </Field>
-          ))}
-        </div>
-      </Card>
-
-      <Card title="Веса стратегий по режимам (сумма = 1)">
-        <div className="grid gap-3 md:grid-cols-2">
-          {(["trend", "range"] as const).map((regime) => (
-            <div key={regime} className="grid grid-cols-3 gap-2">
-              {(["trend", "mean_reversion", "breakout"] as const).map((k) => (
-                <Field key={k} label={`${regime === "trend" ? "Тренд" : "Флэт"}: ${k}`}>
-                  <input className={inputClass} type="number" step={0.05} min={0} max={1} value={cfg.strategy.weights[regime][k]}
-                    onChange={(e) => setPath(["strategy", "weights", regime, k], Number(e.target.value))} />
-                </Field>
-              ))}
-            </div>
-          ))}
+          <Field label="Средняя BTC, дней">
+            <input className={inputClass} type="number" min={20} max={400} value={cfg.strategy.btc_ma_days} disabled={!cfg.strategy.btc_filter}
+              onChange={(e) => setPath(["strategy", "btc_ma_days"], Number(e.target.value))} />
+          </Field>
         </div>
       </Card>
 
@@ -124,6 +118,7 @@ export default function SettingsPage() {
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={m.enabled} onChange={(e) => setPath(["markets", name, "enabled"], e.target.checked)} />
               {name} <Badge>{m.category}</Badge>
+              {m.category !== "spot" && <Badge tone="warn">не проверялся</Badge>}
             </label>
             <input className={inputClass} value={m.symbols.join(" ")}
               onChange={(e) => setPath(["markets", name, "symbols"], e.target.value.toUpperCase().split(/[\s,]+/).filter(Boolean))} />

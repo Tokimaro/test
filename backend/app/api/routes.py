@@ -16,7 +16,7 @@ from sqlalchemy import Select, desc, func, select
 from app.api.context import Ctx, User
 from app.api.security import mask, verify_password, verify_totp
 from app.backtest.engine import ClosedTrade
-from app.backtest.metrics import breakdown, confidence_calibration, equity_stats, trade_stats
+from app.backtest.metrics import breakdown, equity_stats, trade_stats
 from app.core.runner import TRADING_CONFIG_KEY
 from app.db.candles import SqlCandleStore, dt_to_ms
 from app.db.models import (
@@ -101,10 +101,8 @@ async def get_status(ctx: Ctx, user: User) -> dict[str, Any]:
         "engine": engine.status() if engine is not None else None,
         "equity": _num(eq.equity) if eq else None,
         "unrealized": _num(eq.unrealized_pnl) if eq else None,
-        "open_risk": _num(eq.open_risk) if eq else None,
+        "invested": _num(eq.open_risk) if eq else None,  # вложено в монеты, USDT
         "equity_ts": _ts(eq.ts) if eq else None,
-        "day_pnl_pct": round(risk.day_pnl_pct(), 3) if risk else None,
-        "week_pnl_pct": round(risk.week_pnl_pct(), 3) if risk else None,
         "drawdown_pct": round(risk.drawdown_pct(), 3) if risk else None,
         "markets": {
             name: {"symbols": m.symbols, "enabled": m.enabled, "type": m.market_type.value}
@@ -116,43 +114,46 @@ async def get_status(ctx: Ctx, user: User) -> dict[str, Any]:
 # ---------------------------------------------------------------------- позиции
 @router.get("/positions")
 async def positions(ctx: Ctx, user: User) -> list[dict[str, Any]]:
+    """Монеты стратегии: владения и целевые доли (в т.ч. монеты с долей 0)."""
     engine = ctx.runtime.engine if ctx.runtime else None
     if engine is None:
         return []
-    live: dict[str, Any] = {}
-    for broker in engine.brokers.values():
-        try:
-            for p in await broker.get_positions():
-                live[p.symbol] = p
-        except Exception:  # панель не должна падать из-за биржи
-            pass
+    status_ = engine.status()
+    capital = None
+    async with ctx.sm() as s:
+        eq = await s.scalar(
+            select(EquitySnapshotRow)
+            .where(EquitySnapshotRow.mode == ctx.repo.mode)
+            .order_by(desc(EquitySnapshotRow.ts))
+            .limit(1)
+        )
+    if eq is not None:
+        capital = float(eq.equity)
     out = []
-    for symbol, tr in engine.tracked.items():
-        pos = tr.pos
-        ex = live.get(symbol)
-        risk = pos.risk_amount
-        unreal = float(ex.unrealized_pnl) if ex is not None else None
+    for symbol in engine.symbol_market:
+        h = engine.holdings.get(symbol)
+        price = engine.prices.get(symbol)
+        sg = engine.last_signal.get(symbol)
+        value = h.qty * price if h is not None and price else 0.0
         out.append(
             {
-                "trade_id": tr.trade_id,
                 "symbol": symbol,
-                "direction": pos.direction.value,
-                "strategy": pos.strategy,
-                "entry": pos.entry,
-                "qty": pos.qty,
-                "remaining": pos.remaining,
-                "stop": pos.stop,
-                "stop_kind": pos.stop_kind.value,
-                "tp1": pos.tp1,
-                "tp1_done": pos.tp1_done,
-                "tp2": pos.tp2,
-                "confidence": pos.confidence,
-                "regime": pos.regime,
-                "opened_ts": pos.opened_ts,
-                "bars_held": pos.bars_held,
-                "unrealized": unreal,
-                "unrealized_r": unreal / risk if unreal is not None and risk > 0 else None,
-                "confirmed": tr.confirmed,
+                "trade_id": h.trade_id if h else None,
+                "qty": h.qty if h else 0.0,
+                "entry": h.avg_entry if h else None,
+                "price": price,
+                "value": value,
+                "weight": value / capital if capital else None,
+                "target_weight": engine.targets.get(symbol, 0.0),
+                "score": sg.score if sg else None,
+                "unrealized": (price - h.avg_entry) * h.qty if h and price else None,
+                "unrealized_pct": (price / h.avg_entry - 1) * 100
+                if h and price and h.avg_entry
+                else None,
+                "realized": h.realized if h else None,
+                "opened_ts": h.opened_ts if h else None,
+                "components": sg.components if sg else {},
+                "next_rebalance_ts": status_["next_rebalance_ts"],
             }
         )
     return out
@@ -168,19 +169,18 @@ def _engine_or_409(ctx: Ctx) -> Any:
 @router.post("/positions/{symbol}/close")
 async def close_position(symbol: str, ctx: Ctx, user: User) -> dict[str, str]:
     engine = _engine_or_409(ctx)
-    if symbol not in engine.tracked:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "нет открытой позиции")
+    if symbol not in engine.holdings:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "монеты нет в портфеле")
     await engine.close_manually(symbol)
-    return {"status": "closing"}
+    return {"status": "sold"}
 
 
-@router.post("/positions/{symbol}/breakeven")
-async def breakeven(symbol: str, ctx: Ctx, user: User) -> dict[str, str]:
+@router.post("/control/rebalance")
+async def rebalance(ctx: Ctx, user: User) -> dict[str, Any]:
+    """Внеплановая ребалансировка к последним рассчитанным долям."""
     engine = _engine_or_409(ctx)
-    if symbol not in engine.tracked:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "нет открытой позиции")
-    await engine.move_to_breakeven(symbol)
-    return {"status": "ok"}
+    await engine.rebalance_now()
+    return dict(engine.status())
 
 
 # ---------------------------------------------------------------------- сделки
@@ -226,19 +226,13 @@ def _trade_dict(t: TradeRow, symbol: str) -> dict[str, Any]:
         "direction": t.direction,
         "strategy": t.strategy,
         "status": t.status,
-        "regime": extra.get("regime"),
-        "confidence": t.confidence,
         "entry": _num(t.entry_price),
         "exit": _num(t.exit_price),
         "qty": _num(t.qty),
-        "initial_stop": _num(t.initial_stop),
-        "stop": _num(t.stop_loss),
-        "tp1": _num(t.tp1),
-        "tp2": _num(t.tp2),
-        "tp1_done": t.tp1_done,
-        "risk_amount": _num(t.risk_amount),
+        "invested": extra.get("invested"),
+        "return_pct": extra.get("return_pct"),
+        "target_weight": extra.get("target_weight"),
         "pnl": _num(t.realized_pnl),
-        "r_multiple": t.r_multiple,
         "close_reason": t.close_reason,
         "bars_held": t.bars_held,
         "opened_ts": _ts(t.opened_at),
@@ -339,8 +333,9 @@ def _signal_dict(sg: SignalRow, symbol: str) -> dict[str, Any]:
         "ts": _ts(sg.ts),
         "symbol": symbol,
         "direction": sg.direction,
-        "confidence": sg.confidence,
-        "regime": sg.regime,
+        "weight_pct": sg.confidence,  # целевая доля монеты, %
+        "score": (sg.components or {}).get("score"),
+        "rebalance": sg.acted,
         "acted": sg.acted,
         "reject_reason": sg.reject_reason,
         "components": sg.components,
@@ -353,7 +348,7 @@ async def signals(
     user: User,
     symbol: str | None = None,
     acted: bool | None = None,
-    with_direction: bool = True,
+    with_direction: bool = False,  # True — только монеты с долей > 0
     limit: int = Query(200, ge=1, le=1000),
 ) -> list[dict[str, Any]]:
     q = (
@@ -406,11 +401,12 @@ def _as_closed(t: TradeRow, symbol: str) -> ClosedTrade:
         exit_ts=_ts(t.closed_at) or 0,
         entry=float(t.entry_price or 0),
         exit=float(t.exit_price or 0),
+        stop=0.0,
         qty=float(t.qty),
         pnl=float(t.realized_pnl),
         fees=float(t.fees),
         funding=0.0,
-        risk_amount=float(t.risk_amount),
+        risk_amount=float((t.extra or {}).get("invested", 0.0)),
         r_multiple=float(t.r_multiple or 0.0),
         bars_held=t.bars_held,
         close_reason=t.close_reason or "",
@@ -442,13 +438,9 @@ async def stats(
         hour[str(dt.hour)] = hour.get(str(dt.hour), 0.0) + c.pnl
     return {
         "summary": {**eq_stats, **trade_stats(closed)},
-        "by_strategy": breakdown(closed, "strategy"),
         "by_symbol": breakdown(closed, "symbol"),
-        "by_regime": breakdown(closed, "regime"),
         "by_close_reason": breakdown(closed, "close_reason"),
-        "by_direction": breakdown(closed, "direction"),
-        "calibration": confidence_calibration(closed),
-        "r_distribution": [round(c.r_multiple, 3) for c in closed],
+        "return_distribution": [round(c.r_multiple * 100, 2) for c in closed],
         "pnl_by_weekday": weekday,
         "pnl_by_hour": hour,
     }
@@ -460,7 +452,7 @@ async def candles(
     symbol: str,
     ctx: Ctx,
     user: User,
-    tf: Timeframe = Timeframe.H1,
+    tf: Timeframe = Timeframe.D1,
     limit: int = Query(500, ge=10, le=5000),
     end_ms: int | None = None,
 ) -> list[dict[str, float]]:
@@ -604,7 +596,6 @@ class BacktestIn(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=20)
     market: str = "crypto"
     equity: float = Field(10_000, gt=0)
-    walk_forward: bool = False
 
 
 @router.get("/backtests")
@@ -654,9 +645,7 @@ async def start_backtest(body: BacktestIn, ctx: Ctx, user: User) -> dict[str, st
         raise HTTPException(status.HTTP_409_CONFLICT, "бэктест уже выполняется")
     job_id = uuid.uuid4().hex[:8]
     ctx.jobs[job_id] = {"status": "running", "symbols": body.symbols}
-    args = argparse.Namespace(
-        symbols=body.symbols, market=body.market, equity=body.equity, walk_forward=body.walk_forward
-    )
+    args = argparse.Namespace(symbols=body.symbols, market=body.market, equity=body.equity)
 
     async def job() -> None:
         try:

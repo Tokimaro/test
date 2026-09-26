@@ -25,7 +25,11 @@ dependencies = [
 
 [project.optional-dependencies]
 # чтение датасетов в Parquet для исследований (app.backtest.dataset)
-research = ["pyarrow>=17"]
+research = [
+    "lightgbm>=4.5",
+    "pyarrow>=17",
+    "scikit-learn>=1.5",
+]
 
 [dependency-groups]
 dev = [

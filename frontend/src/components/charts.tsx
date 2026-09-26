@@ -154,25 +154,32 @@ export function CandleChart({ candles, levels = [], markers = [], height = 420 }
   return <div ref={ref} aria-label="Свечной график" />;
 }
 
-/** Гистограмма R-результатов: корзины по 0.5R, прибыльные/убыточные — статусными цветами. */
-export function RHistogram({ values, height = 200 }: { values: number[]; height?: number }) {
+/** Гистограмма результатов: прибыльные/убыточные корзины — статусными цветами. */
+export function RHistogram({ values, height = 200, step = 0.5, lo = -3, hi = 4, unit = "R" }: {
+  values: number[];
+  height?: number;
+  step?: number;
+  lo?: number;
+  hi?: number;
+  unit?: string;
+}) {
   if (values.length === 0) return <div className="text-sm text-muted">Нет закрытых сделок</div>;
-  const step = 0.5;
   const buckets = new Map<number, number>();
   for (const v of values) {
-    const b = Math.max(-3, Math.min(4, Math.floor(v / step) * step));
+    const b = Math.max(lo, Math.min(hi, Math.floor(v / step) * step));
     buckets.set(b, (buckets.get(b) ?? 0) + 1);
   }
   // все корзины между минимумом и максимумом, включая пустые — иначе ось X неравномерна
   const present = [...buckets.keys()];
   const keys: number[] = [];
   for (let k = Math.min(...present); k <= Math.max(...present) + 1e-9; k += step) {
-    keys.push(Math.round(k * 2) / 2);
+    keys.push(Math.round(k / step) * step);
   }
   const max = Math.max(...buckets.values());
+  const fmt = (x: number) => (Number.isInteger(step) ? x.toFixed(0) : x.toFixed(1));
   return (
     <div>
-      <div className="flex items-end gap-0.5" style={{ height }} role="img" aria-label="Распределение R">
+      <div className="flex items-end gap-0.5" style={{ height }} role="img" aria-label={`Распределение, ${unit}`}>
         {keys.map((k) => {
           const count = buckets.get(k) ?? 0;
           return (
@@ -185,7 +192,7 @@ export function RHistogram({ values, height = 200 }: { values: number[]; height?
                 }}
               />
               <div className="pointer-events-none absolute bottom-full left-1/2 z-10 mb-1 hidden -translate-x-1/2 whitespace-nowrap rounded border border-line bg-surface px-2 py-1 text-xs group-hover:block">
-                {k.toFixed(1)}…{(k + step).toFixed(1)}R: {count}
+                {fmt(k)}…{fmt(k + step)}{unit}: {count}
               </div>
             </div>
           );
@@ -193,12 +200,12 @@ export function RHistogram({ values, height = 200 }: { values: number[]; height?
       </div>
       <div className="mt-1 flex gap-0.5 text-[10px] text-muted">
         {keys.map((k) => (
-          <div key={k} className="flex-1 text-center">{k.toFixed(1)}</div>
+          <div key={k} className="flex-1 text-center">{fmt(k)}</div>
         ))}
       </div>
       <div className="mt-2 flex gap-4 text-xs text-ink-2">
-        <span><span className="mr-1 inline-block size-2 rounded-sm" style={{ background: "var(--good)" }} />≥ 0R (прибыль)</span>
-        <span><span className="mr-1 inline-block size-2 rounded-sm" style={{ background: "var(--bad)" }} />&lt; 0R (убыток)</span>
+        <span><span className="mr-1 inline-block size-2 rounded-sm" style={{ background: "var(--good)" }} />≥ 0{unit} (прибыль)</span>
+        <span><span className="mr-1 inline-block size-2 rounded-sm" style={{ background: "var(--bad)" }} />&lt; 0{unit} (убыток)</span>
       </div>
     </div>
   );
