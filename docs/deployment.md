@@ -131,7 +131,7 @@ docker compose version              # v2.x
 sudo mkdir -p /opt/tradebot && sudo chown deploy:deploy /opt/tradebot
 git clone https://github.com/Tokimaro/test.git /opt/tradebot
 cd /opt/tradebot
-git checkout claude/happy-ride-w38das   # ветка с ботом; после слияния PR — основная ветка
+git checkout main
 cp .env.example .env
 chmod 600 .env
 ```
@@ -168,7 +168,8 @@ TB_TELEGRAM_CHAT_ID=<id чата>
 ```
 
 Необязательные переменные: `TB_PAPER_INITIAL_EQUITY` (стартовый капитал paper, по умолчанию
-10000 USDT), `TB_JWT_TTL_MINUTES` (время сессии панели, 60).
+10000 USDT), `TB_JWT_TTL_MINUTES` (время сессии панели, 60), `NPM_REGISTRY` (зеркало npm для
+сборки панели, если `registry.npmjs.org` недоступен — см. «Типичные проблемы»).
 
 **Сохраните копию `.env` в менеджере паролей.** Без `TB_MASTER_KEY` ключи Bybit, сохранённые
 через панель, расшифровать нельзя; `POSTGRES_PASSWORD` задаётся базе при первом создании и потом
@@ -377,6 +378,7 @@ docker image prune -f
 | Симптом | Причина и решение |
 |---|---|
 | Сборка падает, `Killed` на `npm ci`/`npm run build` | не хватает памяти — добавьте swap (шаг 2) |
+| Сборка падает на `npm ci`: `EIDLETIMEOUT`, `ETIMEDOUT`, `ECONNRESET` для `registry.npmjs.org` | нет стабильной связи с реестром npm. Проверьте с хоста: `curl -sI https://registry.npmjs.org/react`. **Хост отвечает, а сборка висит** — обычно MTU (VPN, ВМ): соберите в сети хоста `docker build --network=host -f backend/Dockerfile -t tradebot-backend .`, затем `docker compose up -d` (имя образа — `<папка>-backend`, см. вывод `docker compose build`). **Хост тоже не отвечает** — включите VPN на хосте или задайте зеркало в `.env`: `NPM_REGISTRY=https://registry.npmmirror.com/`, затем `docker compose build --no-cache backend && docker compose up -d` |
 | `invalid request, please check your server timestamp` | часы ушли — `chronyc tracking`, `sudo systemctl restart chrony` |
 | Ошибки 403 / «region» от Bybit | страна сервера запрещена Bybit — переносите сервер |
 | `API key is invalid` / `IP not in whitelist` | ключ от другой сети (testnet ↔ mainnet) или не тот IP в привязке |
